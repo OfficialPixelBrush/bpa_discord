@@ -1,0 +1,31 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "fetch",
+      "displayName": "Auto-fetch D++ (no vcpkg needed)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "vcpkg",
+      "displayName": "D++ from vcpkg (needs VCPKG_ROOT)",
+      "inherits": "fetch",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": { "BPA_DISCORD_FETCH_DPP": "OFF" }
+    },
+    {
+      "name": "vcpkg-windows",
+      "displayName": "D++ from vcpkg, Windows (non-static triplet)",
+      "inherits": "vcpkg",
+      "cacheVariables": { "VCPKG_TARGET_TRIPLET": "x64-windows" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "fetch", "configurePreset": "fetch" },
+    { "name": "vcpkg", "configurePreset": "vcpkg" },
+    { "name": "vcpkg-windows", "configurePreset": "vcpkg-windows" }
+  ]
+}

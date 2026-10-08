@@ -1,0 +1,7 @@
+{
+  "name": "bpa-discord",
+  "version-string": "1.0",
+  "dependencies": [
+    "dpp"
+  ]
+}

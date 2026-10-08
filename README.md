@@ -11,7 +11,8 @@ It bridges your Minecraft server and a Discord channel:
 
 ## Compilation
 
-Requires a C++20 compiler and [D++ (dpp)](https://dpp.dev).
+Requires a C++20 compiler, CMake 3.16+ and OpenSSL development files
+(`libssl-dev` / `openssl-devel` / `openssl` via vcpkg).
 
 ```bash
 cmake -B build
