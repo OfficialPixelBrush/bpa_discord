@@ -1,0 +1,329 @@
+name: Build & Release Addon
+
+# Manual-only. Builds the bpa_discord addon for 5 targets and publishes one
+# GitHub Release with all the binaries attached.
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag for this release (e.g. v1.0.0)"
+        required: true
+      release_name:
+        description: "Release title (leave blank to reuse the tag)"
+        required: false
+      release_notes:
+        description: "Release notes (leave blank to auto-generate from commits)"
+        required: false
+      draft:
+        description: "Create as a draft (review before publishing)"
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark as a pre-release"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  # <format> needs GCC 13+. Pulled from the ubuntu-toolchain-r PPA so we keep
+  # the older glibc of ubuntu-22.04 (2.35) for wide compatibility.
+  LINUX_GCC_VERSION: "13"
+  ADDON_NAME: bpa_discord
+  # D++ 10.1.3 declares old CMake policy minimums; let CMake 4.x accept them.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-addon-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Sanity check: tag_name must match ADDON_VERSION in bpa_discord.cpp
+  # ---------------------------------------------------------------------
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag_name matches ADDON_VERSION
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          TAG_VERSION="${TAG#v}"  # strip a leading "v" (v1.0.0 -> 1.0.0)
+
+          ADDON_VERSION=$(sed -nE 's/.*ADDON_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' bpa_discord.cpp | head -n1)
+
+          if [ -z "$ADDON_VERSION" ]; then
+            echo "::error::Could not find ADDON_VERSION in bpa_discord.cpp"
+            exit 1
+          fi
+
+          echo "tag_name:      $TAG"
+          echo "tag version:   $TAG_VERSION"
+          echo "addon version: $ADDON_VERSION"
+
+          if [ "$TAG_VERSION" != "$ADDON_VERSION" ]; then
+            echo "::error::tag_name '${TAG}' implies version '${TAG_VERSION}', but bpa_discord.cpp has ADDON_VERSION '${ADDON_VERSION}'. Bump ADDON_VERSION (and vcpkg.json) or fix the tag before releasing."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------
+  # Windows x86_64  (D++ from vcpkg, dynamic x64-windows triplet)
+  # ---------------------------------------------------------------------
+  windows-x64:
+    needs: check-version
+    runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBPA_DISCORD_FETCH_DPP=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "package"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          # Addon DLL plus the runtime DLLs vcpkg copied next to it
+          # (dpp.dll, OpenSSL, zlib, ...).
+          Copy-Item build\*.dll $out\
+          Copy-Item README.md,LICENSE $out\
+          Get-ChildItem $out
+          Compress-Archive -Path $out\* -DestinationPath "$env:ADDON_NAME-windows-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ${{ env.ADDON_NAME }}-windows-x86_64.zip
+
+  # ---------------------------------------------------------------------
+  # Windows arm64 (native GH-hosted arm64 Windows runner)
+  # ---------------------------------------------------------------------
+  windows-arm64:
+    needs: check-version
+    runs-on: windows-11-arm
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-arm64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBPA_DISCORD_FETCH_DPP=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=arm64-windows
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "package"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item build\*.dll $out\
+          Copy-Item README.md,LICENSE $out\
+          Get-ChildItem $out
+          Compress-Archive -Path $out\* -DestinationPath "$env:ADDON_NAME-windows-arm64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          path: ${{ env.ADDON_NAME }}-windows-arm64.zip
+
+  # ---------------------------------------------------------------------
+  # Linux x86_64 (glibc) - native. D++ is fetched and linked statically.
+  # ---------------------------------------------------------------------
+  linux-x86_64:
+    needs: check-version
+    runs-on: ubuntu-22.04 # glibc 2.35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain + dependencies
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ninja-build zip \
+            gcc-${LINUX_GCC_VERSION} g++-${LINUX_GCC_VERSION} \
+            libssl-dev zlib1g-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-${LINUX_GCC_VERSION} \
+            -DCMAKE_CXX_COMPILER=g++-${LINUX_GCC_VERSION}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Package
+        run: |
+          out=package
+          mkdir -p "$out"
+          cp build/${ADDON_NAME}.so "$out"/
+          cp README.md LICENSE "$out"/
+          (cd "$out" && zip -r "../${ADDON_NAME}-linux-x86_64.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ env.ADDON_NAME }}-linux-x86_64.zip
+
+  # ---------------------------------------------------------------------
+  # Linux aarch64 (glibc) - native GH-hosted arm64 Linux runner
+  # ---------------------------------------------------------------------
+  linux-aarch64:
+    needs: check-version
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain + dependencies
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ninja-build zip \
+            gcc-${LINUX_GCC_VERSION} g++-${LINUX_GCC_VERSION} \
+            libssl-dev zlib1g-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-${LINUX_GCC_VERSION} \
+            -DCMAKE_CXX_COMPILER=g++-${LINUX_GCC_VERSION}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Package
+        run: |
+          out=package
+          mkdir -p "$out"
+          cp build/${ADDON_NAME}.so "$out"/
+          cp README.md LICENSE "$out"/
+          (cd "$out" && zip -r "../${ADDON_NAME}-linux-aarch64.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: ${{ env.ADDON_NAME }}-linux-aarch64.zip
+
+  # ---------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon) - native GH-hosted arm64 runner
+  # ---------------------------------------------------------------------
+  macos-arm64:
+    needs: check-version
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ninja openssl@3
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Package
+        run: |
+          out=package
+          mkdir -p "$out"
+          cp build/${ADDON_NAME}.so "$out"/
+          cp README.md LICENSE "$out"/
+          (cd "$out" && zip -r "../${ADDON_NAME}-macos-arm64.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: ${{ env.ADDON_NAME }}-macos-arm64.zip
+
+  # ---------------------------------------------------------------------
+  # Publish everything as one GitHub Release
+  # ---------------------------------------------------------------------
+  release:
+    needs:
+      - check-version
+      - windows-x64
+      - windows-arm64
+      - linux-x86_64
+      - linux-aarch64
+      - macos-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ inputs.release_name || inputs.tag_name }}
+          body: ${{ inputs.release_notes }}
+          generate_release_notes: ${{ inputs.release_notes == '' }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          files: artifacts/**/*.zip
