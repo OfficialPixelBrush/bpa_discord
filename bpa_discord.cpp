@@ -57,7 +57,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "0.1.1";
+constexpr const char* ADDON_VERSION = "0.1.2";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
@@ -408,9 +408,9 @@ void WriteConfigTemplate() {
 	        "# (at most one every 5 minutes), so the count may lag slightly behind.\n"
 	        "discord-topic-status=false\n"
 	        "# Topic while the server is running. {count} is replaced with the player count.\n"
-	        "discord-topic-online=Server online | Players: {count}\n"
+	        "discord-topic-online=Online | Players: {count}\n"
 	        "# Topic set when the server shuts down.\n"
-	        "discord-topic-offline=Server offline\n";
+	        "discord-topic-offline=Offline\n";
 }
 
 Config LoadConfig() {
@@ -525,25 +525,16 @@ void SendNotice(Bot& _bot, const std::string& _text, uint32_t _color) {
 // a D++ thread. Needs the Manage Channels permission.
 void SetChannelTopic(dpp::cluster& _cluster, dpp::snowflake _channel, const std::string& _topic,
                      std::function<void(bool ok, const std::string& error)> _done) {
-	dpp::cluster* cluster = &_cluster;
-	cluster->channel_get(_channel, [cluster, _topic, _done](const dpp::confirmation_callback_t& fetched) {
-		if (fetched.is_error()) {
-			_done(false, fetched.get_error().message);
-			return;
-		}
-		dpp::channel channel = fetched.get<dpp::channel>();
-		if (channel.topic == _topic) { // nothing to do, and no edit means no rate-limit hit
-			_done(true, "");
-			return;
-		}
-		channel.set_topic(_topic);
-		cluster->channel_edit(channel, [_done](const dpp::confirmation_callback_t& edited) {
-			if (edited.is_error())
-				_done(false, edited.get_error().message);
-			else
-				_done(true, "");
-		});
-	});
+	nlohmann::json body = { { "topic", _topic } };   // D++ bundles nlohmann::json
+	_cluster.request(API_PATH "/channels/" + std::to_string(static_cast<uint64_t>(_channel)),
+	                 dpp::m_patch,
+	                 [_done](const dpp::http_request_completion_t& r) {
+		                 if (r.status >= 200 && r.status < 300)
+			                 _done(true, "");
+		                 else
+			                 _done(false, "HTTP " + std::to_string(r.status) + ": " + r.body);
+	                 },
+	                 body.dump(), "application/json");
 }
 
 // ---------------------------------------------------------------------------------
