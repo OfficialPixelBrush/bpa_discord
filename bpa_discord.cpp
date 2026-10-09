@@ -525,16 +525,21 @@ void SendNotice(Bot& _bot, const std::string& _text, uint32_t _color) {
 // a D++ thread. Needs the Manage Channels permission.
 void SetChannelTopic(dpp::cluster& _cluster, dpp::snowflake _channel, const std::string& _topic,
                      std::function<void(bool ok, const std::string& error)> _done) {
-	nlohmann::json body = { { "topic", _topic } };   // D++ bundles nlohmann::json
-	_cluster.request(API_PATH "/channels/" + std::to_string(static_cast<uint64_t>(_channel)),
-	                 dpp::m_patch,
-	                 [_done](const dpp::http_request_completion_t& r) {
-		                 if (r.status >= 200 && r.status < 300)
-			                 _done(true, "");
-		                 else
-			                 _done(false, "HTTP " + std::to_string(r.status) + ": " + r.body);
-	                 },
-	                 body.dump(), "application/json");
+	nlohmann::json body = { { "topic", _topic } };
+	const std::string url =
+	    "https://discord.com/api/v10/channels/" + std::to_string(static_cast<uint64_t>(_channel));
+
+	_cluster.request(
+	    url, dpp::m_patch,
+	    [_done](const dpp::http_request_completion_t& r) {
+		    if (r.status >= 200 && r.status < 300)
+			    _done(true, "");
+		    else
+			    _done(false, "HTTP " + std::to_string(r.status) + ": " + r.body);
+	    },
+	    body.dump(), "application/json",
+	    { { "Authorization", "Bot " + _cluster.token },
+	      { "User-Agent", "DiscordBot (bpa_discord, 1.0)" } });
 }
 
 // ---------------------------------------------------------------------------------
