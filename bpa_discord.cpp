@@ -10,7 +10,8 @@
  * Features:
  *   - Minecraft chat  -> Discord (via webhook with the player's name + skin face, or as the bot)
  *   - Discord chat    -> Minecraft (messages in the configured channel)
- *   - Join/leave embeds, server start/stop notices
+ *   - Join/leave embeds (with the current player count), server start/stop notices
+ *   - Optional: live player count in the channel topic, and "Server offline" on shutdown
  *   - Slash commands: /status, /list, /version
  *
  * Configuration lives in "bpa_discord.properties" in the server's working directory
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -55,7 +57,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "0.1.0";
+constexpr const char* ADDON_VERSION = "0.1.1";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
@@ -64,6 +66,16 @@ constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 // arrives ahead of Login can confuse the client.
 constexpr uint64_t CHAT_READY_TICKS = 40;
 
+// Discord rate-limits channel edits harshly (roughly 2 per 10 minutes per channel), so the
+// topic is only refreshed this often; changes in between are coalesced into one update.
+constexpr std::chrono::minutes TOPIC_MIN_INTERVAL{ 5 };
+
+// How long shutdown waits for the "Server offline" topic edit before giving up.
+constexpr std::chrono::milliseconds TOPIC_SHUTDOWN_WAIT{ 3000 };
+
+constexpr const char* DEFAULT_TOPIC_ONLINE = "Online | Players: {count}";
+constexpr const char* DEFAULT_TOPIC_OFFLINE = "Offline";
+
 enum class Level { Info, Warn, Error };
 
 struct Config {
@@ -71,6 +83,12 @@ struct Config {
 	std::string channelId;
 	std::string guildId;
 	std::string webhookUrl;
+
+	// Channel topic status. Off by default: it overwrites the channel's existing topic and
+	// needs the bot to have the Manage Channels permission.
+	bool topicEnabled = false;
+	std::string topicOnline = DEFAULT_TOPIC_ONLINE; // {count} = players online
+	std::string topicOffline = DEFAULT_TOPIC_OFFLINE;
 };
 
 struct InboundChat {
@@ -101,6 +119,12 @@ struct Bot {
 	// Server thread only.
 	uint64_t tick = 0;
 	bool startNoticeSent = false;
+	bool topicEverSent = false;
+	std::chrono::steady_clock::time_point lastTopicSend{};
+
+	// Touched from both the server thread and D++ callbacks.
+	std::atomic<bool> topicDirty{ false };
+	std::atomic<bool> topicInFlight{ false };
 };
 
 const bp_api* g_api = nullptr;
@@ -165,6 +189,22 @@ std::string Trim(const std::string& _s) {
 	while (e > b && std::isspace(static_cast<unsigned char>(_s[e - 1])))
 		--e;
 	return _s.substr(b, e - b);
+}
+
+bool ParseBool(const std::string& _value, bool _default) {
+	std::string v = Trim(_value);
+	std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (v == "true" || v == "1" || v == "yes" || v == "on")
+		return true;
+	if (v == "false" || v == "0" || v == "no" || v == "off")
+		return false;
+	return _default;
+}
+
+std::string FormatTopic(const std::string& _template, size_t _count) {
+	std::string topic = _template;
+	ReplaceAll(topic, "{count}", std::to_string(_count));
+	return topic;
 }
 
 std::string RemoveMinecraftFormatting(const std::string& _input) {
@@ -361,7 +401,16 @@ void WriteConfigTemplate() {
 	        "# Optional: a webhook URL for the SAME channel (Channel Settings -> Integrations -> Webhooks).\n"
 	        "# When set, in-game chat is relayed under each player's own name + skin face\n"
 	        "# instead of the bot's. Leave empty to relay chat as the bot.\n"
-	        "discord-webhook-url=\n";
+	        "discord-webhook-url=\n"
+	        "\n"
+	        "# Optional: show live server status in the channel topic. This OVERWRITES the topic and\n"
+	        "# requires the bot to have the Manage Channels permission. Updates are rate-limited\n"
+	        "# (at most one every 5 minutes), so the count may lag slightly behind.\n"
+	        "discord-topic-status=false\n"
+	        "# Topic while the server is running. {count} is replaced with the player count.\n"
+	        "discord-topic-online=Server online | Players: {count}\n"
+	        "# Topic set when the server shuts down.\n"
+	        "discord-topic-offline=Server offline\n";
 }
 
 Config LoadConfig() {
@@ -382,8 +431,17 @@ Config LoadConfig() {
 		return std::string{};
 	};
 
-	return Config{ get("discord-token"), get("discord-channel-id"), get("discord-guild-id"),
-		           get("discord-webhook-url") };
+	Config cfg;
+	cfg.token = get("discord-token");
+	cfg.channelId = get("discord-channel-id");
+	cfg.guildId = get("discord-guild-id");
+	cfg.webhookUrl = get("discord-webhook-url");
+	cfg.topicEnabled = ParseBool(get("discord-topic-status"), false);
+	if (const std::string v = get("discord-topic-online"); !v.empty())
+		cfg.topicOnline = v;
+	if (const std::string v = get("discord-topic-offline"); !v.empty())
+		cfg.topicOffline = v;
+	return cfg;
 }
 
 // ---------------------------------------------------------------------------------
@@ -430,7 +488,7 @@ void SendPlayerChat(Bot& _bot, const std::string& _username, const std::string& 
 	    [bot](const dpp::confirmation_callback_t& result) { SendConfirmCallbackLog(bot, "chat message", result); });
 }
 
-void SendPlayerEvent(Bot& _bot, const std::string& _rawUsername, bool _joined) {
+void SendPlayerEvent(Bot& _bot, const std::string& _rawUsername, bool _joined, size_t _onlineCount) {
 	if (!_bot.running.load() || !_bot.cluster)
 		return;
 
@@ -439,7 +497,8 @@ void SendPlayerEvent(Bot& _bot, const std::string& _rawUsername, bool _joined) {
 	dpp::embed embed;
 	embed.set_color(_joined ? 0x55FF55 : 0xFF5555)
 	    .set_author(username, "", BuildSkinAvatarUrl(username, 256))
-	    .set_description(std::format("**{}** {} the game", username, _joined ? "joined" : "left"));
+	    .set_description(std::format("**{}** {} the game", username, _joined ? "joined" : "left"))
+	    .set_footer(dpp::embed_footer().set_text(std::format("{} player{} online", _onlineCount, _onlineCount == 1 ? "" : "s")));
 
 	dpp::message msg(_bot.channel, embed);
 	msg.set_allowed_mentions(false, false, false, false, {}, {});
@@ -461,6 +520,32 @@ void SendNotice(Bot& _bot, const std::string& _text, uint32_t _color) {
 	    msg, [bot](const dpp::confirmation_callback_t& result) { SendConfirmCallbackLog(bot, "notice", result); });
 }
 
+// Sets the channel topic. Fetches the channel first and edits that object, so only the topic
+// changes and the channel's other settings are written back untouched. The callback runs on
+// a D++ thread. Needs the Manage Channels permission.
+void SetChannelTopic(dpp::cluster& _cluster, dpp::snowflake _channel, const std::string& _topic,
+                     std::function<void(bool ok, const std::string& error)> _done) {
+	dpp::cluster* cluster = &_cluster;
+	cluster->channel_get(_channel, [cluster, _topic, _done](const dpp::confirmation_callback_t& fetched) {
+		if (fetched.is_error()) {
+			_done(false, fetched.get_error().message);
+			return;
+		}
+		dpp::channel channel = fetched.get<dpp::channel>();
+		if (channel.topic == _topic) { // nothing to do, and no edit means no rate-limit hit
+			_done(true, "");
+			return;
+		}
+		channel.set_topic(_topic);
+		cluster->channel_edit(channel, [_done](const dpp::confirmation_callback_t& edited) {
+			if (edited.is_error())
+				_done(false, edited.get_error().message);
+			else
+				_done(true, "");
+		});
+	});
+}
+
 // ---------------------------------------------------------------------------------
 // Player registry (shared between the server thread and D++ threads)
 // ---------------------------------------------------------------------------------
@@ -472,6 +557,35 @@ std::vector<std::string> OnlineNames(Bot& _bot) {
 	for (const auto& p : _bot.players)
 		names.push_back(p.name);
 	return names;
+}
+
+// Server thread only. Pushes the current player count to the channel topic when it changed
+// and the rate-limit window allows. Several joins/leaves in a row collapse into one edit.
+void PumpTopicUpdate(Bot& _bot) {
+	if (!_bot.config.topicEnabled || !_bot.topicDirty.load() || !_bot.running.load() || !_bot.cluster)
+		return;
+	if (_bot.topicInFlight.load())
+		return;
+
+	const auto now = std::chrono::steady_clock::now();
+	if (_bot.topicEverSent && now - _bot.lastTopicSend < TOPIC_MIN_INTERVAL)
+		return;
+
+	_bot.topicDirty.store(false);
+	_bot.topicInFlight.store(true);
+	_bot.topicEverSent = true;
+	_bot.lastTopicSend = now;
+
+	Bot* bot = &_bot;
+	SetChannelTopic(*_bot.cluster, _bot.channel, FormatTopic(_bot.config.topicOnline, OnlineNames(_bot).size()),
+	                [bot](bool ok, const std::string& error) {
+		                if (!ok) {
+			                LogAsync(*bot, Level::Warn,
+			                         "Failed to update channel topic (does the bot have Manage Channels?): " + error);
+			                bot->topicDirty.store(true); // retry on a later tick, still rate-limited
+		                }
+		                bot->topicInFlight.store(false);
+	                });
 }
 
 // ---------------------------------------------------------------------------------
@@ -680,15 +794,35 @@ void StopBot() {
 
 	LogNow(Level::Info, "Shutting down...");
 
+	const bool setTopic = bot.config.topicEnabled;
+	const std::string offlineTopic = bot.config.topicOffline;
+	Bot* botPtr = &bot;
+
 	// Ownership moves into a worker so a stuck SSL/event-loop join can't freeze server exit.
 	// DPP's cluster::shutdown() joins the engine thread; if that thread is blocked inside
 	// OpenSSL (common when Discord HTTP is unhealthy) the join never returns.
 	auto done = std::make_shared<std::atomic<bool>>(false);
-	std::thread worker([cluster = std::move(cluster), channel = bot.channel, done]() mutable {
+	std::thread worker([cluster = std::move(cluster), channel = bot.channel, done, setTopic, offlineTopic,
+	                    botPtr]() mutable {
 		try {
 			// Fire-and-forget goodbye; never wait on Discord here.
 			cluster->message_create(dpp::message(channel, "Server stopped!"), [](const dpp::confirmation_callback_t&) {});
-			std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+			if (setTopic) {
+				// Bounded wait so the edit can go out before the gateway is torn down. If Discord
+				// is rate-limiting us it won't make it, and the previous topic stays.
+				auto topicDone = std::make_shared<std::atomic<bool>>(false);
+				SetChannelTopic(*cluster, channel, offlineTopic, [botPtr, topicDone](bool ok, const std::string& error) {
+					if (!ok)
+						LogAsync(*botPtr, Level::Warn, "Couldn't set the offline topic: " + error);
+					topicDone->store(true);
+				});
+				const auto topicDeadline = std::chrono::steady_clock::now() + TOPIC_SHUTDOWN_WAIT;
+				while (!topicDone->load() && std::chrono::steady_clock::now() < topicDeadline)
+					std::this_thread::sleep_for(std::chrono::milliseconds(25));
+			} else {
+				std::this_thread::sleep_for(std::chrono::milliseconds(150));
+			}
 			cluster->shutdown();
 			cluster.reset();
 		} catch (...) {
@@ -696,7 +830,7 @@ void StopBot() {
 		done->store(true);
 	});
 
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
 	while (!done->load() && std::chrono::steady_clock::now() < deadline)
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -734,11 +868,14 @@ void OnPlayerJoin(const bp_api* api, const bp_player_join_event* ev) {
 
 	const char* rawName = api->player.getUsername(ev->player);
 	const std::string name = rawName ? rawName : "Player";
+	size_t online;
 	{
 		std::lock_guard lock(g_bot->mutex);
 		g_bot->players.push_back(PlayerEntry{ ev->player, name, g_bot->tick });
+		online = g_bot->players.size();
 	}
-	SendPlayerEvent(*g_bot, name, true);
+	g_bot->topicDirty.store(true);
+	SendPlayerEvent(*g_bot, name, true, online);
 }
 
 void OnPlayerLeave(const bp_api* api, const bp_player_leave_event* ev) {
@@ -746,6 +883,7 @@ void OnPlayerLeave(const bp_api* api, const bp_player_leave_event* ev) {
 		return;
 
 	std::string name;
+	size_t online;
 	{
 		std::lock_guard lock(g_bot->mutex);
 		auto it = std::find_if(g_bot->players.begin(), g_bot->players.end(),
@@ -754,12 +892,14 @@ void OnPlayerLeave(const bp_api* api, const bp_player_leave_event* ev) {
 			name = it->name;
 			g_bot->players.erase(it);
 		}
+		online = g_bot->players.size();
 	}
+	g_bot->topicDirty.store(true);
 	if (name.empty()) {
 		const char* rawName = api->player.getUsername(ev->player);
 		name = rawName ? rawName : "Player";
 	}
-	SendPlayerEvent(*g_bot, name, false);
+	SendPlayerEvent(*g_bot, name, false, online);
 }
 
 void OnPlayerChat(const bp_api* api, bp_player_chat_event* ev) {
@@ -784,7 +924,10 @@ void OnServerTick(const bp_api* api, const bp_server_tick_event*) {
 	if (!bot.startNoticeSent) {
 		bot.startNoticeSent = true;
 		SendNotice(bot, "Server started!", 0x55FF55);
+		bot.topicDirty.store(true); // publish the initial "online" topic
 	}
+
+	PumpTopicUpdate(bot);
 
 	std::queue<InboundChat> chats;
 	std::vector<bp_player*> recipients;
