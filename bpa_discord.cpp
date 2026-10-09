@@ -55,7 +55,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "1.0";
+constexpr const char* ADDON_VERSION = "0.1.0";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
