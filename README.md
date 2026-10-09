@@ -40,4 +40,11 @@ discord-token=             # bot token (enable the Message Content Intent)
 discord-channel-id=        # channel to bridge
 discord-guild-id=          # optional, makes slash commands appear instantly
 discord-webhook-url=       # optional, webhook of the same channel
+
+# optional, show live status in the channel topic (default: false)
+discord-topic-status=false
+# topic while running; {count} = players online
+discord-topic-online=Online | Players: {count}
+# topic set on shutdown
+discord-topic-offline=Offline
 ```
