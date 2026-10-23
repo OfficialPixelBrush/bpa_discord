@@ -12,7 +12,8 @@
  *   - Discord chat    -> Minecraft (messages in the configured channel)
  *   - Join/leave embeds (with the current player count), server start/stop notices
  *   - Optional: live player count in the channel topic, and "Server offline" on shutdown
- *   - Slash commands: /status, /list, /version
+ *   - Slash commands: /status, /list, /tps, /version, and (opt-in) /execute
+ *   - Crash reports: the crash log is posted to the channel as a file attachment
  *
  * Configuration lives in "bpa_discord.properties" in the server's working directory
  * (a template is generated on first load). For migration convenience, any key missing
@@ -57,7 +58,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "0.1.2";
+constexpr const char* ADDON_VERSION = "0.2.0";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
@@ -72,6 +73,19 @@ constexpr std::chrono::minutes TOPIC_MIN_INTERVAL{ 5 };
 
 // How long shutdown waits for the "Server offline" topic edit before giving up.
 constexpr std::chrono::milliseconds TOPIC_SHUTDOWN_WAIT{ 3000 };
+
+// How long the crash handler waits for the crash report to reach Discord before letting the
+// server finish dying.
+constexpr std::chrono::milliseconds CRASH_REPORT_WAIT{ 8000 };
+
+// Discord rejects uploads over its size limit; crash logs beyond this are cut (head kept).
+constexpr size_t CRASH_LOG_MAX_BYTES = 8 * 1024 * 1024;
+
+// Server stats (TPS/MSPT) are re-read from the host every this many ticks.
+constexpr uint64_t STATS_REFRESH_TICKS = 20;
+
+// /execute input limit.
+constexpr size_t EXECUTE_MAX_LENGTH = 256;
 
 constexpr const char* DEFAULT_TOPIC_ONLINE = "Online | Players: {count}";
 constexpr const char* DEFAULT_TOPIC_OFFLINE = "Offline";
@@ -89,6 +103,15 @@ struct Config {
 	bool topicEnabled = false;
 	std::string topicOnline = DEFAULT_TOPIC_ONLINE; // {count} = players online
 	std::string topicOffline = DEFAULT_TOPIC_OFFLINE;
+
+	// Post the crash log to the channel when the server crashes.
+	bool crashReports = true;
+
+	// /execute is only registered when at least one role or user is allowed to use it.
+	std::vector<dpp::snowflake> executeRoles;
+	std::vector<dpp::snowflake> executeUsers;
+
+	bool ExecuteEnabled() const { return !executeRoles.empty() || !executeUsers.empty(); }
 };
 
 struct InboundChat {
@@ -102,6 +125,13 @@ struct PlayerEntry {
 	uint64_t joinTick;
 };
 
+// An /execute invocation waiting for the server thread (host API calls are server-thread only).
+struct PendingCommand {
+	dpp::slashcommand_t event;
+	std::string command;
+	std::string user;
+};
+
 struct Bot {
 	Config config;
 	std::unique_ptr<dpp::cluster> cluster;
@@ -113,12 +143,20 @@ struct Bot {
 	std::queue<InboundChat> inbound;
 	std::vector<PlayerEntry> players;
 	std::queue<std::pair<Level, std::string>> logs;
+	std::queue<PendingCommand> commands;
 
 	std::atomic<bool> running{ false };
+
+	// Cached host stats. Written on the server thread, read by slash-command handlers.
+	std::string serverVersion; // set once before the bot starts
+	std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
+	std::atomic<double> tps{ -1.0 }; // < 0 = not sampled yet
+	std::atomic<double> mspt{ -1.0 };
 
 	// Server thread only.
 	uint64_t tick = 0;
 	bool startNoticeSent = false;
+	bool crashReported = false;
 	bool topicEverSent = false;
 	std::chrono::steady_clock::time_point lastTopicSend{};
 
@@ -205,6 +243,49 @@ std::string FormatTopic(const std::string& _template, size_t _count) {
 	std::string topic = _template;
 	ReplaceAll(topic, "{count}", std::to_string(_count));
 	return topic;
+}
+
+// Escapes Discord markdown so names like "my_cool_name" don't render as italics.
+std::string EscapeMarkdown(const std::string& _input) {
+	std::string out;
+	out.reserve(_input.size());
+	for (const char c : _input) {
+		if (c == '\\' || c == '_' || c == '*' || c == '~' || c == '`' || c == '|' || c == '>')
+			out += '\\';
+		out += c;
+	}
+	return out;
+}
+
+std::string FormatDuration(std::chrono::seconds _total) {
+	const long long secs = _total.count();
+	const long long d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60;
+	if (d > 0)
+		return std::format("{}d {}h {}m", d, h, m);
+	if (h > 0)
+		return std::format("{}h {}m", h, m);
+	return std::format("{}m {}s", m, secs % 60);
+}
+
+// Splits "123, 456;789" into snowflakes; invalid entries are skipped.
+std::vector<dpp::snowflake> ParseSnowflakeList(const std::string& _value) {
+	std::vector<dpp::snowflake> out;
+	std::string token;
+	auto flush = [&] {
+		if (!token.empty()) {
+			if (dpp::snowflake id{ token }; id != 0)
+				out.push_back(id);
+			token.clear();
+		}
+	};
+	for (const char c : _value) {
+		if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c)))
+			flush();
+		else
+			token += c;
+	}
+	flush();
+	return out;
 }
 
 std::string RemoveMinecraftFormatting(const std::string& _input) {
@@ -410,7 +491,16 @@ void WriteConfigTemplate() {
 	        "# Topic while the server is running. {count} is replaced with the player count.\n"
 	        "discord-topic-online=Online | Players: {count}\n"
 	        "# Topic set when the server shuts down.\n"
-	        "discord-topic-offline=Offline\n";
+	        "discord-topic-offline=Offline\n"
+	        "\n"
+	        "# Post the crash log to the channel (as a file) when the server crashes.\n"
+	        "discord-crash-reports=true\n"
+	        "\n"
+	        "# Optional: let Discord moderators run server commands with /execute. The command is\n"
+	        "# only registered when at least one of these is set (comma-separated Discord IDs).\n"
+	        "# Only works in the bridged channel. A role match OR a user match is enough.\n"
+	        "discord-execute-role-ids=\n"
+	        "discord-execute-user-ids=\n";
 }
 
 Config LoadConfig() {
@@ -441,6 +531,9 @@ Config LoadConfig() {
 		cfg.topicOnline = v;
 	if (const std::string v = get("discord-topic-offline"); !v.empty())
 		cfg.topicOffline = v;
+	cfg.crashReports = ParseBool(get("discord-crash-reports"), true);
+	cfg.executeRoles = ParseSnowflakeList(get("discord-execute-role-ids"));
+	cfg.executeUsers = ParseSnowflakeList(get("discord-execute-user-ids"));
 	return cfg;
 }
 
@@ -585,6 +678,271 @@ void PumpTopicUpdate(Bot& _bot) {
 }
 
 // ---------------------------------------------------------------------------------
+// Slash command replies (run on D++ threads; they only touch the cached stats)
+// ---------------------------------------------------------------------------------
+
+uint32_t TpsColor(double _tps) {
+	if (_tps < 0)
+		return 0x99AAB5; // not sampled yet
+	if (_tps >= 19.0)
+		return 0x55FF55;
+	if (_tps >= 15.0)
+		return 0xFFAA00;
+	return 0xFF5555;
+}
+
+std::string FormatTps(double _tps) {
+	return _tps < 0 ? "n/a" : std::format("{:.2f}", _tps);
+}
+
+std::string FormatMspt(double _mspt) {
+	return _mspt < 0 ? "n/a" : std::format("{:.2f} ms", _mspt);
+}
+
+std::string ServerVersionOrUnknown(const Bot& _bot) {
+	return _bot.serverVersion.empty() ? "unknown" : _bot.serverVersion;
+}
+
+dpp::message EmbedMessage(const dpp::embed& _embed) {
+	dpp::message msg;
+	msg.add_embed(_embed);
+	msg.set_allowed_mentions(false, false, false, false, {}, {});
+	return msg;
+}
+
+dpp::message BuildStatusReply(Bot& _bot) {
+	const size_t online = OnlineNames(_bot).size();
+	const double tps = _bot.tps.load();
+	const double mspt = _bot.mspt.load();
+	const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - _bot.startedAt);
+
+	dpp::embed embed;
+	embed.set_title("Server status")
+	    .set_color(TpsColor(tps))
+	    .add_field("Players", std::to_string(online), true)
+	    .add_field("TPS", FormatTps(tps), true)
+	    .add_field("MSPT", FormatMspt(mspt), true)
+	    .add_field("Uptime", FormatDuration(uptime), true)
+	    .add_field("Server", ServerVersionOrUnknown(_bot), true)
+	    .add_field("Bridge", std::string(ADDON_NAME) + " " + ADDON_VERSION, true);
+	return EmbedMessage(embed);
+}
+
+dpp::message BuildListReply(Bot& _bot) {
+	const auto names = OnlineNames(_bot);
+
+	dpp::embed embed;
+	embed.set_title(std::format("Players online ({})", names.size())).set_color(names.empty() ? 0x99AAB5 : 0x55FF55);
+
+	if (names.empty()) {
+		embed.set_description("No players online.");
+	} else {
+		std::string body;
+		size_t shown = 0;
+		for (const std::string& name : names) {
+			const std::string line = "• " + EscapeMarkdown(RemoveMinecraftFormatting(name)) + "\n";
+			if (body.size() + line.size() > 3800)
+				break; // embed descriptions cap at 4096 chars
+			body += line;
+			++shown;
+		}
+		if (shown < names.size())
+			body += std::format("…and {} more", names.size() - shown);
+		embed.set_description(body);
+	}
+	return EmbedMessage(embed);
+}
+
+dpp::message BuildTpsReply(Bot& _bot) {
+	const double tps = _bot.tps.load();
+	dpp::embed embed;
+	embed.set_title("Performance")
+	    .set_color(TpsColor(tps))
+	    .add_field("TPS", FormatTps(tps), true)
+	    .add_field("MSPT", FormatMspt(_bot.mspt.load()), true);
+	return EmbedMessage(embed);
+}
+
+dpp::message BuildVersionReply(Bot& _bot) {
+	dpp::embed embed;
+	embed.set_title("Versions")
+	    .set_color(0x5865F2)
+	    .add_field("Discord bridge", std::string(ADDON_NAME) + " " + ADDON_VERSION, true)
+	    .add_field("Server", ServerVersionOrUnknown(_bot), true);
+	return EmbedMessage(embed);
+}
+
+// ---------------------------------------------------------------------------------
+// /execute: lets configured Discord roles/users run server commands. The permission
+// check happens here (not only via Discord's own command permissions, which a guild
+// admin can override), and the command itself runs on the server thread.
+// ---------------------------------------------------------------------------------
+
+bool IsExecuteAuthorized(const Config& _cfg, const dpp::interaction& _interaction) {
+	const dpp::snowflake userId = _interaction.get_issuing_user().id;
+	if (std::find(_cfg.executeUsers.begin(), _cfg.executeUsers.end(), userId) != _cfg.executeUsers.end())
+		return true;
+
+	for (const dpp::snowflake role : _interaction.member.get_roles()) {
+		if (std::find(_cfg.executeRoles.begin(), _cfg.executeRoles.end(), role) != _cfg.executeRoles.end())
+			return true;
+	}
+	return false;
+}
+
+void HandleExecuteCommand(Bot& _bot, const dpp::slashcommand_t& _event) {
+	auto deny = [&](const std::string& _why) { _event.reply(dpp::message(_why).set_flags(dpp::m_ephemeral)); };
+	const dpp::interaction& interaction = _event.command;
+	const std::string who = std::format("{} ({})", interaction.get_issuing_user().username,
+	                                    static_cast<uint64_t>(interaction.get_issuing_user().id));
+
+	if (!_bot.config.ExecuteEnabled())
+		return deny("`/execute` is not enabled.");
+	if (interaction.channel_id != _bot.channel)
+		return deny("`/execute` can only be used in the bridged channel.");
+	if (!IsExecuteAuthorized(_bot.config, interaction)) {
+		LogAsync(_bot, Level::Warn, "Discord user " + who + " tried /execute without permission");
+		return deny("You don't have permission to use `/execute`.");
+	}
+
+	const dpp::command_value param = _event.get_parameter("command");
+	const std::string* raw = std::get_if<std::string>(&param);
+	std::string command = raw ? Trim(*raw) : std::string{};
+	while (!command.empty() && command.front() == '/')
+		command.erase(command.begin()); // accept both "stop" and "/stop"
+	command = Trim(command);
+
+	if (command.empty())
+		return deny("Please provide a command.");
+	if (command.size() > EXECUTE_MAX_LENGTH)
+		return deny(std::format("Command is too long (max {} characters).", EXECUTE_MAX_LENGTH));
+	if (std::any_of(command.begin(), command.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
+		return deny("Commands can't contain control characters or newlines.");
+
+	// Acknowledge now (Discord wants a reply within 3 s); the result is filled in once the
+	// server thread has actually run the command.
+	_event.thinking(false);
+	std::lock_guard lock(_bot.mutex);
+	_bot.commands.push(PendingCommand{ _event, std::move(command), who });
+}
+
+// Server thread only.
+void RunPendingCommands(Bot& _bot, const bp_api* _api) {
+	std::queue<PendingCommand> pending;
+	{
+		std::lock_guard lock(_bot.mutex);
+		pending.swap(_bot.commands);
+	}
+
+	while (!pending.empty()) {
+		PendingCommand cmd = std::move(pending.front());
+		pending.pop();
+
+		LogNow(Level::Info, "Discord user " + cmd.user + " ran command: /" + cmd.command);
+		// There's no player behind a Discord command, so there is no sender.
+		const bool ok = _api->commands.execute(_api, nullptr, cmd.command.c_str());
+
+		std::string shown = cmd.command;
+		std::replace(shown.begin(), shown.end(), '`', '\'');
+
+		dpp::embed embed;
+		embed.set_color(ok ? 0x55FF55 : 0xFF5555)
+		    .set_description(std::format("{} `/{}`", ok ? "✅ Command executed:" : "❌ The server didn't accept:", shown))
+		    .set_footer(dpp::embed_footer().set_text("Run by " + cmd.user));
+		cmd.event.edit_original_response(EmbedMessage(embed));
+	}
+}
+
+// ---------------------------------------------------------------------------------
+// Crash reports
+// ---------------------------------------------------------------------------------
+
+std::string ReadFileCapped(const std::string& _path, size_t _maxBytes) {
+	std::ifstream file(_path, std::ios::binary);
+	if (!file)
+		return {};
+	std::string data(_maxBytes + 1, '\0'); // +1 so "too large" can be detected
+	file.read(data.data(), static_cast<std::streamsize>(data.size()));
+	data.resize(static_cast<size_t>(file.gcount()));
+	return data;
+}
+
+// Cuts to at most _maxBytes without splitting a UTF-8 sequence.
+std::string TruncateUtf8(const std::string& _s, size_t _maxBytes) {
+	if (_s.size() <= _maxBytes)
+		return _s;
+	size_t end = _maxBytes;
+	while (end > 0 && (static_cast<unsigned char>(_s[end]) & 0xC0) == 0x80)
+		--end;
+	return _s.substr(0, end);
+}
+
+// Runs inside the host's crash event. The process is about to die, so this posts the
+// report (and the offline topic, if enabled) and then waits a bounded time for Discord.
+void SendCrashReport(Bot& _bot, const std::string& _version, const std::string& _logPath, std::string _log) {
+	if (_log.empty() && !_logPath.empty())
+		_log = ReadFileCapped(_logPath, CRASH_LOG_MAX_BYTES);
+
+	bool truncated = false;
+	if (_log.size() > CRASH_LOG_MAX_BYTES) {
+		_log = TruncateUtf8(_log, CRASH_LOG_MAX_BYTES);
+		truncated = true;
+	}
+
+	dpp::embed embed;
+	embed.set_title("Server crashed!")
+	    .set_color(0xFF5555)
+	    .add_field("Server version", _version.empty() ? ServerVersionOrUnknown(_bot) : _version, true)
+	    .add_field("Players online", std::to_string(OnlineNames(_bot).size()), true);
+	if (!_logPath.empty())
+		embed.add_field("Log file", "`" + _logPath + "`", false);
+
+	if (!_log.empty()) {
+		// A short preview inline; the whole log is attached.
+		std::string excerpt = TruncateUtf8(_log, 900);
+		const bool cut = excerpt.size() < _log.size();
+		ReplaceAll(excerpt, "```", "'''");
+		embed.set_description("```\n" + excerpt + (cut ? "\n…" : "") + "\n```");
+		if (truncated)
+			embed.set_footer(dpp::embed_footer().set_text("Log was too large and was cut off at 8 MiB"));
+	} else {
+		embed.set_description("No crash log was provided by the server.");
+	}
+
+	auto pending = std::make_shared<std::atomic<int>>(1);
+	dpp::message msg(_bot.channel, embed);
+	msg.set_allowed_mentions(false, false, false, false, {}, {});
+	if (!_log.empty())
+		msg.add_file("crash-log.txt", _log, "text/plain");
+
+	Bot* bot = &_bot;
+	_bot.cluster->message_create(msg, [bot, pending](const dpp::confirmation_callback_t& result) {
+		SendConfirmCallbackLog(bot, "crash report", result);
+		pending->fetch_sub(1);
+	});
+
+	if (_bot.config.topicEnabled) {
+		pending->fetch_add(1);
+		SetChannelTopic(*_bot.cluster, _bot.channel, _bot.config.topicOffline,
+		                [bot, pending](bool ok, const std::string& error) {
+			                if (!ok)
+				                LogAsync(*bot, Level::Warn, "Couldn't set the offline topic after a crash: " + error);
+			                pending->fetch_sub(1);
+		                });
+	}
+
+	const auto deadline = std::chrono::steady_clock::now() + CRASH_REPORT_WAIT;
+	while (pending->load() > 0 && std::chrono::steady_clock::now() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+	FlushLogs(_bot);
+	if (pending->load() > 0)
+		LogNow(Level::Warn, "Crash report may not have reached Discord (timed out)");
+	else
+		LogNow(Level::Info, "Crash report sent to Discord");
+}
+
+// ---------------------------------------------------------------------------------
 // Bot lifecycle
 // ---------------------------------------------------------------------------------
 
@@ -606,6 +964,10 @@ void PinSelf() {
 void StartBot() {
 	auto bot = std::make_unique<Bot>();
 	bot->config = LoadConfig();
+	if (g_api && g_api->server.getVersion) {
+		if (const char* version = g_api->server.getVersion())
+			bot->serverVersion = version;
+	}
 	const Config& cfg = bot->config;
 
 	if (cfg.token.empty() || cfg.channelId.empty()) {
@@ -664,11 +1026,18 @@ void StartBot() {
 
 			const dpp::snowflake me = raw->cluster->me.id;
 			// Bulk create replaces the guild/global command set.
-			const std::vector<dpp::slashcommand> commands{
-				dpp::slashcommand("status", "Show Minecraft server status", me),
+			std::vector<dpp::slashcommand> commands{
+				dpp::slashcommand("status", "Show server status: players, TPS, MSPT and uptime", me),
 				dpp::slashcommand("list", "List online Minecraft players", me),
-				dpp::slashcommand("version", "Show the Discord bridge version", me),
+				dpp::slashcommand("tps", "Show server TPS and MSPT", me),
+				dpp::slashcommand("version", "Show the Discord bridge and server versions", me),
 			};
+			// Only offered when someone is actually allowed to use it.
+			if (raw->config.ExecuteEnabled()) {
+				commands.push_back(dpp::slashcommand("execute", "Run a server command (moderators only)", me)
+				                       .add_option(dpp::command_option(dpp::co_string, "command",
+				                                                       "Command to run, without the leading /", true)));
+			}
 
 			if (!guildId.empty()) {
 				raw->cluster->guild_bulk_command_create(commands, dpp::snowflake{ guildId });
@@ -705,24 +1074,18 @@ void StartBot() {
 
 			const std::string name = event.command.get_command_name();
 
-			if (name == "status") {
-				const size_t online = OnlineNames(*raw).size();
-				event.reply(std::format("{} {} — {} player(s) online", ADDON_NAME, ADDON_VERSION, online));
-			} else if (name == "list") {
-				const auto names = OnlineNames(*raw);
-				if (names.empty()) {
-					event.reply("No players online.");
-				} else {
-					std::string joined;
-					for (size_t i = 0; i < names.size(); ++i)
-						joined += (i ? ", " : "") + names[i];
-					event.reply(std::format("{} player(s): {}", names.size(), joined));
-				}
-			} else if (name == "version") {
-				event.reply(std::format("{} {}", ADDON_NAME, ADDON_VERSION));
-			} else {
+			if (name == "status")
+				event.reply(BuildStatusReply(*raw));
+			else if (name == "list")
+				event.reply(BuildListReply(*raw));
+			else if (name == "tps")
+				event.reply(BuildTpsReply(*raw));
+			else if (name == "version")
+				event.reply(BuildVersionReply(*raw));
+			else if (name == "execute")
+				HandleExecuteCommand(*raw, event);
+			else
 				event.reply(dpp::message("Unknown command.").set_flags(dpp::m_ephemeral));
-			}
 		});
 
 		raw->cluster = std::move(cluster);
@@ -780,6 +1143,8 @@ void StopBot() {
 		cluster = std::move(bot.cluster);
 		while (!bot.inbound.empty())
 			bot.inbound.pop();
+		while (!bot.commands.empty())
+			bot.commands.pop();
 	}
 
 	if (!cluster) {
@@ -858,6 +1223,23 @@ void OnAddonUnload(const bp_api*, const bp_addon_unload*) {
 	g_api = nullptr;
 }
 
+// Fired by the host when the server crashes. Not every crash can be reported (the process may
+// be in a bad state), so this is best-effort and never throws.
+void OnCrash(const bp_api*, const bp_crash_event* ev) {
+	try {
+		if (!g_bot || !ev || !g_bot->config.crashReports || g_bot->crashReported)
+			return;
+		Bot& bot = *g_bot;
+		if (!bot.running.load() || !bot.cluster)
+			return;
+		bot.crashReported = true;
+
+		SendCrashReport(bot, ev->version_string ? ev->version_string : "",
+		                ev->crash_log_path ? ev->crash_log_path : "", ev->crash_log ? ev->crash_log : "");
+	} catch (...) {
+	}
+}
+
 void OnPlayerJoin(const bp_api* api, const bp_player_join_event* ev) {
 	if (!g_bot)
 		return;
@@ -917,6 +1299,14 @@ void OnServerTick(const bp_api* api, const bp_server_tick_event*) {
 	++bot.tick;
 	FlushLogs(bot);
 
+	// Refresh cached stats (host API is server-thread only; slash handlers read the cache).
+	if (bot.tick % STATS_REFRESH_TICKS == 1) {
+		bot.tps.store(api->server.getTpsAverage(api));
+		bot.mspt.store(api->server.getMsptAverage(api));
+	}
+
+	RunPendingCommands(bot, api);
+
 	if (!bot.startNoticeSent) {
 		bot.startNoticeSent = true;
 		SendNotice(bot, "Server started!", 0x55FF55);
@@ -965,6 +1355,7 @@ extern "C"
 	info.events.playerLeave = OnPlayerLeave;
 	info.events.playerChat = OnPlayerChat;
 	info.events.serverTick = OnServerTick;
+	info.events.crash = OnCrash;
 	info.events.addonLoad = OnAddonLoad;
 	info.events.addonUnload = OnAddonUnload;
 	return info;

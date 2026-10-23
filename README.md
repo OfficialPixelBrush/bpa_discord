@@ -7,7 +7,9 @@ It bridges your Minecraft server and a Discord channel:
 - In-game chat is posted to Discord, via a webhook (player's own name and skin face) or as the bot.
 - Messages in the Discord channel are broadcast in-game
 - Join/leave embeds and server started/stopped notices
-- Slash commands: `/status`, `/list`, `/version`
+- Slash commands: `/status` (players, TPS, MSPT, uptime, versions), `/list`, `/tps`, `/version`, and
+  `/execute` (opt-in, see below)
+- Crash reports: when the server crashes, the crash log is posted to the channel as a file attachment
 
 ## Compilation
 
@@ -48,3 +50,34 @@ discord-topic-online=Online | Players: {count}
 # topic set on shutdown
 discord-topic-offline=Offline
 ```
+
+# optional, post the crash log to the channel when the server crashes (default: true)
+discord-crash-reports=true
+
+# optional, enables /execute. Comma-separated Discord role / user IDs (a match on either is enough)
+discord-execute-role-ids=
+discord-execute-user-ids=
+```
+
+## Crash reports
+
+On a server crash the bridge posts an embed (server version, players online, log path, a short
+preview) with the full crash log attached as `crash-log.txt`. If the host doesn't pass the log text
+but does pass a path, the file is read from there. Logs over 8 MiB are cut off. The crash handler waits
+up to 8 seconds for Discord to accept the report. With `discord-topic-status=true`, the channel
+topic is also set to the offline text.
+
+## `/execute`
+
+`/execute command:<command>` lets moderators run server commands from Discord. It is **disabled
+unless** `discord-execute-role-ids` or `discord-execute-user-ids` is set, and then it is only
+registered with Discord when enabled. Permissions are checked by the addon itself, not just by
+Discord's command permissions, and it only works in the bridged channel. Every use (and every
+denied attempt) is logged on the server.
+
+Notes:
+
+- The command runs on the server thread with no player as sender. Discord only shows whether the server
+  accepted the command; command output isn't relayed back.
+- Anyone who can use it can run any server command, including `stop`. Only grant it to people you
+  trust with console access.
