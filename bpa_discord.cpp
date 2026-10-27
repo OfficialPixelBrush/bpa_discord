@@ -58,7 +58,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "0.2.0";
+constexpr const char* ADDON_VERSION = "0.2.1";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
@@ -83,6 +83,11 @@ constexpr size_t CRASH_LOG_MAX_BYTES = 8 * 1024 * 1024;
 
 // Server stats (TPS/MSPT) are re-read from the host every this many ticks.
 constexpr uint64_t STATS_REFRESH_TICKS = 20;
+
+// Skin face URLs get a "?v=" bucket that changes at most this often. A changed skin then
+// shows up in Discord within this window, while repeat messages inside it reuse Discord's
+// cached image instead of hammering the image host.
+constexpr long long SKIN_REFRESH_SECONDS = 60 * 60; // 1 hour
 
 // /execute input limit.
 constexpr size_t EXECUTE_MAX_LENGTH = 256;
@@ -364,6 +369,8 @@ std::vector<std::string> FormatDiscordChatLines(const std::string& _author, cons
 
 // Face-only skin render, cropped server-side by the image host. Discord fetches this
 // URL itself when it renders the message, so we never download or decode a skin.
+// The "?v=" bucket busts Discord's (and the host CDN's) cache at most once per
+// SKIN_REFRESH_SECONDS; it's offset per name so players don't all roll over at once.
 std::string BuildSkinAvatarUrl(const std::string& _username, int _size) {
 	std::string safe;
 	safe.reserve(_username.size());
@@ -373,7 +380,14 @@ std::string BuildSkinAvatarUrl(const std::string& _username, int _size) {
 	}
 	if (safe.empty())
 		safe = "MHF_Steve";
-	return "https://mc-heads.net/avatar/" + safe + "/" + std::to_string(_size);
+
+	const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+	                          std::chrono::system_clock::now().time_since_epoch())
+	                          .count();
+	const long long offset = static_cast<long long>(std::hash<std::string>{}(safe) % SKIN_REFRESH_SECONDS);
+	const long long bucket = (now + offset) / SKIN_REFRESH_SECONDS;
+
+	return "https://mc-heads.net/avatar/" + safe + "/" + std::to_string(_size) + "?v=" + std::to_string(bucket);
 }
 
 // Clamps to Discord's webhook username rules (1-80 chars, no "discord"/"clyde").
