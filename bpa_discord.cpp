@@ -854,7 +854,7 @@ void RunPendingCommands(Bot& _bot, const bp_api* _api) {
 
 		LogNow(Level::Info, "Discord user " + cmd.user + " ran command: /" + cmd.command);
 		// There's no player behind a Discord command, so there is no sender.
-		const bool ok = _api->commands.execute(_api, nullptr, cmd.command.c_str());
+		const bool ok = _api->cmd.execute(_api, nullptr, cmd.command.c_str());
 
 		std::string shown = cmd.command;
 		std::replace(shown.begin(), shown.end(), '`', '\'');
@@ -1227,12 +1227,12 @@ void StopBot() {
 // Addon events (all invoked on the server thread)
 // ---------------------------------------------------------------------------------
 
-void OnAddonLoad(const bp_api* api, const bp_addon_load*) {
+void OnAddonLoad(const bp_api* api) {
 	g_api = api;
 	StartBot();
 }
 
-void OnAddonUnload(const bp_api*, const bp_addon_unload*) {
+void OnAddonUnload(const bp_api*) {
 	StopBot();
 	g_api = nullptr;
 }
