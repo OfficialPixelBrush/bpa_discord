@@ -1365,7 +1365,7 @@ extern "C"
 	info.id = ADDON_ID;
 	info.name = ADDON_NAME;
 	info.version = ADDON_VERSION;
-	info.min_api_version = 1,
+	info.min_api_version = 5,
 	info.max_api_version = 0,
 	info.events.playerJoin = OnPlayerJoin;
 	info.events.playerLeave = OnPlayerLeave;
