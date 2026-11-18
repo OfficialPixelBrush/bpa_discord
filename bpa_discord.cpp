@@ -58,7 +58,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "0.2.1";
+constexpr const char* ADDON_VERSION = "0.2.2";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
@@ -1365,6 +1365,8 @@ extern "C"
 	info.id = ADDON_ID;
 	info.name = ADDON_NAME;
 	info.version = ADDON_VERSION;
+	info.min_api_version = 1,
+	info.max_api_version = 0,
 	info.events.playerJoin = OnPlayerJoin;
 	info.events.playerLeave = OnPlayerLeave;
 	info.events.playerChat = OnPlayerChat;
