@@ -21,11 +21,10 @@
  *   - Slash commands: /status, /list, /tps, /version, and (opt-in) /execute
  *   - Crash reports: the crash log is posted to the channel as a file attachment
  *
- * Global configuration lives in "bpa_discord.properties" and the channel list in
- * "bpa_discord_channels.json", both in the server's working directory (templates are generated
- * on first load). For migration convenience, any property missing in the .properties file is
- * also looked up in "server.properties". The old single-channel keys (discord-channel-id,
- * discord-webhook-url) keep working when the JSON file lists no channels.
+ * All settings live in "bpa_discord.json" in the server's working directory (a template is
+ * generated on first load). Settings from older versions (bpa_discord.properties, discord-*
+ * keys in server.properties) are converted into it automatically and then removed from the old
+ * files.
  *
  * Requires D++ (dpp). The bot needs the Message Content Intent in the Developer Portal.
  */
@@ -40,6 +39,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <fstream>
@@ -69,7 +69,8 @@ constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
 constexpr const char* ADDON_VERSION = "0.3.0";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
-constexpr const char* CHANNELS_FILE = "bpa_discord_channels.json";
+constexpr const char* CHANNELS_FILE = "bpa_discord_channels.json"; // short-lived interim format, only migrated
+constexpr const char* SETTINGS_FILE = "bpa_discord.json";
 constexpr const char* SERVER_CONFIG_FILE = "server.properties";
 
 // Players are only sent Discord chat once they've been registered for this many server
@@ -125,10 +126,6 @@ enum class ReceiveMode {
 struct Config {
 	std::string token;   // default bot token, for channels that don't have their own bot_token
 	std::string guildId; // default guild for slash commands
-
-	// Legacy single-channel keys. Only used when bpa_discord_channels.json lists no channels.
-	std::string channelId;
-	std::string webhookUrl;
 
 	// Global defaults for how Discord users are shown in-game: prefix + name + postfix.
 	// Stored sanitised, so they may contain "§x" colour codes. Every channel can override them.
@@ -754,93 +751,54 @@ std::map<std::string, std::string> ReadProperties(const char* _path) {
 	return props;
 }
 
-void WriteConfigTemplate() {
-	std::ofstream file(CONFIG_FILE);
-	if (!file) {
-		LogNow(Level::Warn, std::string("Couldn't create ") + CONFIG_FILE);
-		return;
-	}
-	file << "# bpa_discord configuration\n"
-	        "#\n"
-	        "# Which channels are bridged, and with which bot / webhook, is set in\n"
-	        "# bpa_discord_channels.json. This file holds the defaults and the global options.\n"
-	        "\n"
-	        "# Default bot token from the Discord Developer Portal (enable the Message Content Intent).\n"
-	        "# Entries in bpa_discord_channels.json can use their own \"bot_token\" instead.\n"
-	        "discord-token=\n"
-	        "# Optional: register slash commands to one guild instantly. Leave empty for global\n"
-	        "# (global registration can take up to an hour to appear). Entries can set their own \"guild_id\".\n"
-	        "discord-guild-id=\n"
-	        "\n"
-	        "# How Discord users are shown in-game: <prefix>name<postfix>. Each is at most 4 visible\n"
-	        "# characters; colour codes such as &9 don't count towards that. Entries in\n"
-	        "# bpa_discord_channels.json can override both. Defaults: [ and ]\n"
-	        "discord-prefix=[\n"
-	        "discord-postfix=]\n"
-	        "\n"
-	        "# Show \"[name] reacted with :thumbsup:\" in-game when someone reacts to a message in a\n"
-	        "# bridged channel. Entries can override this with \"reactions\".\n"
-	        "discord-reactions=true\n"
-	        "\n"
-	        "# Which Discord channels players hear in-game when several are bridged:\n"
-	        "#   all      - every bridged channel\n"
-	        "#   selected - only the channel they picked with /discord select\n"
-	        "discord-receive=all\n"
-	        "\n"
-	        "# Optional: show live server status in the channel topics. This OVERWRITES the topic and\n"
-	        "# requires the bot to have the Manage Channels permission. Updates are rate-limited\n"
-	        "# (at most one every 5 minutes), so the count may lag slightly behind.\n"
-	        "# Entries can override this with \"topic_status\".\n"
-	        "discord-topic-status=false\n"
-	        "# Topic while the server is running. {count} is replaced with the player count.\n"
-	        "discord-topic-online=Online | Players: {count}\n"
-	        "# Topic set when the server shuts down.\n"
-	        "discord-topic-offline=Offline\n"
-	        "\n"
-	        "# Post the crash log to the channels (as a file) when the server crashes.\n"
-	        "discord-crash-reports=true\n"
-	        "\n"
-	        "# Optional: let Discord moderators run server commands with /execute. The command is\n"
-	        "# only registered when at least one of these is set (comma-separated Discord IDs).\n"
-	        "# Only works in the bridged channels. A role match OR a user match is enough.\n"
-	        "discord-execute-role-ids=\n"
-	        "discord-execute-user-ids=\n";
-}
+// ---------------------------------------------------------------------------------
+// Settings live in bpa_discord.json. Older versions used bpa_discord.properties (plus a
+// server.properties fallback) and, briefly, bpa_discord_channels.json; those are converted
+// once, automatically, and then removed from the files they came from.
+// ---------------------------------------------------------------------------------
 
-void WriteChannelsTemplate() {
-	std::ofstream file(CHANNELS_FILE);
-	if (!file) {
-		LogNow(Level::Warn, std::string("Couldn't create ") + CHANNELS_FILE);
-		return;
-	}
-	file << "// bpa_discord channels. One entry per bridged Discord channel; // comments are allowed.\n"
-	        "// Entries can point at different channels, webhooks, bots and even different Discord servers.\n"
-	        "//\n"
-	        "// label        what players type in /discord select <label>. Required, unique, max 32 chars.\n"
-	        "//              The FIRST entry is the default channel players talk through when they join.\n"
-	        "// channel_id   channel to bridge (required)\n"
-	        "// webhook_url  optional webhook of the SAME channel: chat is relayed under each player's own\n"
-	        "//              name + skin face. Leave out to relay chat as the bot.\n"
-	        "// bot_token    optional bot for this channel; falls back to discord-token in bpa_discord.properties.\n"
-	        "//              Channels with the same token share one bot connection.\n"
-	        "//\n"
-	        "// More optional keys (leave them out to use the global setting from bpa_discord.properties):\n"
-	        "//   \"guild_id\"     register slash commands to this server instantly\n"
-	        "//   \"prefix\"       text before a Discord user's name in-game, max 4 characters (colour codes like &9 are free)\n"
-	        "//   \"postfix\"      text after it, max 4 characters. \"\" means none.\n"
-	        "//   \"reactions\"    true/false: show \"[name] reacted with :emoji:\" in-game\n"
-	        "//   \"topic_status\" true/false: show the live status in this channel's topic\n"
-	        "[\n"
-	        "\t{\n"
-	        "\t\t\"label\": \"main\",\n"
-	        "\t\t\"channel_id\": \"\",\n"
-	        "\t\t\"webhook_url\": \"\",\n"
-	        "\t\t\"bot_token\": \"\"\n"
-	        "\t}\n"
-	        "]\n";
-}
+constexpr const char* SETTINGS_HELP =
+    "// bpa_discord settings (JSON; // and /* */ comments are allowed).\n"
+    "//\n"
+    "// Global settings (a channel can override prefix, postfix, reactions and topic_status):\n"
+    "//   token             default bot token from the Discord Developer Portal (enable the Message Content Intent)\n"
+    "//   guild_id          optional: register slash commands to this server instantly (otherwise globally, which\n"
+    "//                     can take up to an hour to show up)\n"
+    "//   prefix, postfix   text around a Discord user's name in-game, max 4 visible characters each.\n"
+    "//                     Colour codes like &9 are free. Defaults: [ and ]. \"\" means none.\n"
+    "//   reactions         show \"[name] reacted with :thumbsup:\" in-game for Discord reactions (default true)\n"
+    "//   receive           \"all\" (default): players hear every channel; \"selected\": only the channel they\n"
+    "//                     picked with /discord select\n"
+    "//   topic_status      show live server status in the channel topics. OVERWRITES the topic and needs the\n"
+    "//                     Manage Channels permission (default false)\n"
+    "//   topic_online      topic while running; {count} = players online\n"
+    "//   topic_offline     topic set when the server shuts down\n"
+    "//   crash_reports     post the crash log to the channels when the server crashes (default true)\n"
+    "//   execute_role_ids, execute_user_ids\n"
+    "//                     Discord ids allowed to use /execute. The command is only enabled when one is set;\n"
+    "//                     a role match OR a user match is enough.\n"
+    "//\n"
+    "// channels: one entry per bridged Discord channel; they can use different webhooks, bots and even\n"
+    "// different Discord servers. The FIRST entry is the default channel players talk through when they join.\n"
+    "//   label         what players type in /discord select <label>. Required, unique, max 32 characters.\n"
+    "//   channel_id    the channel to bridge (required)\n"
+    "//   webhook_url   optional webhook of the SAME channel: chat is relayed under each player's own name and\n"
+    "//                 skin face. Leave out to relay chat as the bot.\n"
+    "//   bot_token     optional bot for this channel; falls back to the global token. Channels with the same\n"
+    "//                 token share one bot connection.\n"
+    "//   guild_id, prefix, postfix, reactions, topic_status: optional per-channel overrides of the global\n"
+    "//                 settings. Leave a key out to use the global value.\n";
 
-// Text value of a JSON key; numbers are accepted too (channel ids are often pasted as numbers).
+struct Settings {
+	Config config;
+	std::vector<LinkSpec> specs;
+};
+
+// ---------------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------------
+
+// Text value of a JSON key; numbers are accepted too (ids are often pasted as numbers).
 std::string JsonText(const nlohmann::json& _obj, const char* _key) {
 	const auto it = _obj.find(_key);
 	if (it == _obj.end())
@@ -877,29 +835,33 @@ std::optional<bool> JsonOptionalBool(const nlohmann::json& _obj, const char* _ke
 	return std::nullopt;
 }
 
-// Reads bpa_discord_channels.json (comments allowed). Returns false when the file doesn't exist.
-bool LoadChannelSpecs(std::vector<LinkSpec>& _out) {
-	std::ifstream file(CHANNELS_FILE, std::ios::binary);
-	if (!file)
-		return false;
-	std::stringstream buffer;
-	buffer << file.rdbuf();
+// An array of ids (strings or numbers), or one comma-separated string.
+std::vector<dpp::snowflake> JsonSnowflakeList(const nlohmann::json& _obj, const char* _key) {
+	const auto it = _obj.find(_key);
+	if (it == _obj.end())
+		return {};
+	if (it->is_string())
+		return ParseSnowflakeList(it->get<std::string>());
 
-	nlohmann::json root;
-	try {
-		root = nlohmann::json::parse(buffer.str(), nullptr, true, /*ignore_comments=*/true);
-	} catch (const std::exception& e) {
-		LogNow(Level::Error, std::string("Couldn't parse ") + CHANNELS_FILE + ": " + e.what());
-		return true;
+	std::vector<dpp::snowflake> out;
+	if (it->is_array()) {
+		for (const auto& value : *it) {
+			std::string text;
+			if (value.is_string())
+				text = Trim(value.get<std::string>());
+			else if (value.is_number_unsigned())
+				text = std::to_string(value.get<uint64_t>());
+			if (const dpp::snowflake id = ParseSnowflake(text); id != 0)
+				out.push_back(id);
+		}
 	}
-	if (!root.is_array()) {
-		LogNow(Level::Error, std::string(CHANNELS_FILE) + " must contain a JSON array of channel entries");
-		return true;
-	}
+	return out;
+}
 
-	for (const auto& item : root) {
+void ParseChannelEntries(const nlohmann::json& _array, std::vector<LinkSpec>& _out) {
+	for (const auto& item : _array) {
 		if (!item.is_object()) {
-			LogNow(Level::Warn, std::string("Ignoring an entry in ") + CHANNELS_FILE + " that is not an object");
+			LogNow(Level::Warn, "Ignoring a channel entry that is not an object");
 			continue;
 		}
 		LinkSpec spec;
@@ -916,40 +878,227 @@ bool LoadChannelSpecs(std::vector<LinkSpec>& _out) {
 		spec.topicStatus = JsonOptionalBool(item, "topic_status");
 		_out.push_back(std::move(spec));
 	}
+}
+
+// Parses the contents of bpa_discord.json. On failure returns false and says why in *_error.
+bool ParseSettings(const std::string& _text, Settings& _out, std::string* _error) {
+	nlohmann::json root;
+	try {
+		root = nlohmann::json::parse(_text, nullptr, true, /*ignore_comments=*/true);
+	} catch (const std::exception& e) {
+		if (_error)
+			*_error = e.what();
+		return false;
+	}
+	if (!root.is_object()) {
+		if (_error)
+			*_error = "the file must contain a JSON object ({ ... })";
+		return false;
+	}
+
+	Config& cfg = _out.config;
+	cfg.token = JsonText(root, "token");
+	cfg.guildId = JsonText(root, "guild_id");
+
+	auto readAffix = [&](const char* _key, std::string& _target) {
+		const auto text = JsonOptionalText(root, _key);
+		if (!text)
+			return;
+		bool cut = false;
+		_target = SanitizeAffix(*text, &cut);
+		if (cut)
+			LogNow(Level::Warn, std::format("\"{}\" is longer than {} characters and was cut to \"{}\"", _key,
+			                                AFFIX_MAX_CHARS, RemoveMinecraftFormatting(_target)));
+	};
+	readAffix("prefix", cfg.prefix);
+	readAffix("postfix", cfg.postfix);
+
+	cfg.reactions = JsonOptionalBool(root, "reactions").value_or(true);
+	cfg.receive = ToLower(JsonText(root, "receive")) == "selected" ? ReceiveMode::Selected : ReceiveMode::All;
+	cfg.topicEnabled = JsonOptionalBool(root, "topic_status").value_or(false);
+	if (const std::string v = JsonText(root, "topic_online"); !v.empty())
+		cfg.topicOnline = v;
+	if (const std::string v = JsonText(root, "topic_offline"); !v.empty())
+		cfg.topicOffline = v;
+	cfg.crashReports = JsonOptionalBool(root, "crash_reports").value_or(true);
+	cfg.executeRoles = JsonSnowflakeList(root, "execute_role_ids");
+	cfg.executeUsers = JsonSnowflakeList(root, "execute_user_ids");
+
+	const auto channels = root.find("channels");
+	if (channels != root.end() && channels->is_array())
+		ParseChannelEntries(*channels, _out.specs);
+	else
+		LogNow(Level::Warn, "\"channels\" is missing or is not an array");
 	return true;
 }
 
-Config LoadConfig() {
-	auto own = ReadProperties(CONFIG_FILE);
-	if (own.empty()) {
-		if (!std::ifstream(CONFIG_FILE).good()) {
-			WriteConfigTemplate();
-			if (!std::ifstream(CHANNELS_FILE).good())
-				WriteChannelsTemplate();
-			LogNow(Level::Warn, std::string("Generated ") + CONFIG_FILE + " and " + CHANNELS_FILE +
-			                        "; fill them in and restart the server.");
+// ---------------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------------
+
+std::string JsonQuote(const std::string& _s) {
+	std::string out = "\"";
+	for (const unsigned char c : _s) {
+		switch (c) {
+		case '"': out += "\\\""; break;
+		case '\\': out += "\\\\"; break;
+		case '\n': out += "\\n"; break;
+		case '\r': out += "\\r"; break;
+		case '\t': out += "\\t"; break;
+		default:
+			if (c < 0x20)
+				out += std::format("\\u{:04x}", static_cast<unsigned>(c));
+			else
+				out += static_cast<char>(c);
 		}
 	}
-	const auto fallback = ReadProperties(SERVER_CONFIG_FILE);
+	return out + "\"";
+}
 
+// Colour codes are easier to type as "&9" than as a literal section sign.
+std::string AffixForFile(std::string _affix) {
+	ReplaceAll(_affix, "\xC2\xA7", "&");
+	return _affix;
+}
+
+// Writes a file via a temporary, so a failure never leaves a half-written settings file behind.
+bool WriteTextFile(const std::string& _path, const std::string& _text) {
+	const std::string tmp = _path + ".tmp";
+	{
+		std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+		if (!file)
+			return false;
+		file << _text;
+		file.flush();
+		if (!file)
+			return false;
+	}
+	std::error_code ec;
+	std::filesystem::rename(tmp, _path, ec);
+	if (ec) {
+		std::filesystem::remove(tmp, ec);
+		return false;
+	}
+	return true;
+}
+
+// Renders bpa_discord.json. _includeEmpty also writes empty webhook/token/guild keys, which is
+// what the first-run template wants.
+std::string BuildSettingsJson(const Config& _c, const std::vector<LinkSpec>& _specs, bool _includeEmpty) {
+	std::string out = SETTINGS_HELP;
+	out += "{\n";
+
+	auto idList = [](const std::vector<dpp::snowflake>& _ids) {
+		std::string text = "[";
+		for (size_t i = 0; i < _ids.size(); ++i)
+			text += (i ? ", " : "") + JsonQuote(std::to_string(static_cast<uint64_t>(_ids[i])));
+		return text + "]";
+	};
+	const auto boolText = [](bool b) { return std::string(b ? "true" : "false"); };
+
+	const std::vector<std::pair<std::string, std::string>> globals = {
+		{ "token", JsonQuote(_c.token) },
+		{ "guild_id", JsonQuote(_c.guildId) },
+		{ "prefix", JsonQuote(AffixForFile(_c.prefix)) },
+		{ "postfix", JsonQuote(AffixForFile(_c.postfix)) },
+		{ "reactions", boolText(_c.reactions) },
+		{ "receive", JsonQuote(_c.receive == ReceiveMode::Selected ? "selected" : "all") },
+		{ "topic_status", boolText(_c.topicEnabled) },
+		{ "topic_online", JsonQuote(_c.topicOnline) },
+		{ "topic_offline", JsonQuote(_c.topicOffline) },
+		{ "crash_reports", boolText(_c.crashReports) },
+		{ "execute_role_ids", idList(_c.executeRoles) },
+		{ "execute_user_ids", idList(_c.executeUsers) },
+	};
+	for (const auto& [key, value] : globals)
+		out += "\t" + JsonQuote(key) + ": " + value + ",\n";
+
+	out += "\t\"channels\": [";
+	for (size_t i = 0; i < _specs.size(); ++i) {
+		const LinkSpec& s = _specs[i];
+		std::vector<std::string> fields;
+		const auto add = [&](const char* key, const std::string& value) {
+			fields.push_back(JsonQuote(key) + ": " + value);
+		};
+		const auto addText = [&](const char* key, const std::string& value) {
+			if (_includeEmpty || !value.empty())
+				add(key, JsonQuote(value));
+		};
+		add("label", JsonQuote(s.label));
+		add("channel_id", JsonQuote(s.channelId));
+		addText("webhook_url", s.webhookUrl);
+		addText("bot_token", s.botToken);
+		addText("guild_id", s.guildId);
+		if (s.prefix)
+			add("prefix", JsonQuote(AffixForFile(*s.prefix)));
+		if (s.postfix)
+			add("postfix", JsonQuote(AffixForFile(*s.postfix)));
+		if (s.reactions)
+			add("reactions", boolText(*s.reactions));
+		if (s.topicStatus)
+			add("topic_status", boolText(*s.topicStatus));
+
+		out += i ? ",\n\t\t{\n" : "\n\t\t{\n";
+		for (size_t f = 0; f < fields.size(); ++f)
+			out += "\t\t\t" + fields[f] + (f + 1 < fields.size() ? ",\n" : "\n");
+		out += "\t\t}";
+	}
+	out += "\n\t]\n}\n";
+	return out;
+}
+
+// An entry with nothing filled in, so a fresh file shows what goes where.
+LinkSpec PlaceholderChannel() {
+	LinkSpec spec;
+	spec.label = "main";
+	return spec;
+}
+
+// ---------------------------------------------------------------------------------
+// Migration from the old formats
+// ---------------------------------------------------------------------------------
+
+const std::vector<std::string>& LegacyPropertyKeys() {
+	static const std::vector<std::string> keys = {
+		"discord-token",         "discord-channel-id",       "discord-guild-id",         "discord-webhook-url",
+		"discord-prefix",        "discord-postfix",          "discord-reactions",        "discord-receive",
+		"discord-topic-status",  "discord-topic-online",     "discord-topic-offline",    "discord-crash-reports",
+		"discord-execute-role-ids", "discord-execute-user-ids",
+	};
+	return keys;
+}
+
+bool IsLegacyKey(const std::string& _key) {
+	const auto& keys = LegacyPropertyKeys();
+	return std::find(keys.begin(), keys.end(), _key) != keys.end();
+}
+
+bool HasLegacyKeys(const std::map<std::string, std::string>& _props) {
+	return std::any_of(_props.begin(), _props.end(), [](const auto& kv) { return IsLegacyKey(kv.first); });
+}
+
+// The old properties, as a Config plus the single channel the old format could describe.
+Config ConfigFromProperties(const std::map<std::string, std::string>& _own,
+                            const std::map<std::string, std::string>& _fallback, std::string& _channelId,
+                            std::string& _webhookUrl) {
 	auto get = [&](const char* _key) {
-		if (auto it = own.find(_key); it != own.end() && !it->second.empty())
+		if (auto it = _own.find(_key); it != _own.end() && !it->second.empty())
 			return it->second;
-		if (auto it = fallback.find(_key); it != fallback.end())
+		if (auto it = _fallback.find(_key); it != _fallback.end())
 			return it->second;
 		return std::string{};
 	};
 
 	Config cfg;
 	cfg.token = get("discord-token");
-	cfg.channelId = get("discord-channel-id");
 	cfg.guildId = get("discord-guild-id");
-	cfg.webhookUrl = get("discord-webhook-url");
+	_channelId = get("discord-channel-id");
+	_webhookUrl = get("discord-webhook-url");
 
-	// An empty prefix/postfix is a valid choice ("none"), so only a missing key means "default".
+	// An empty prefix/postfix was a valid choice ("none"), so only a missing key means "default".
 	auto readAffix = [&](const char* _key, std::string& _target) {
-		const auto it = own.find(_key);
-		if (it == own.end())
+		const auto it = _own.find(_key);
+		if (it == _own.end())
 			return;
 		bool cut = false;
 		_target = SanitizeAffix(it->second, &cut);
@@ -962,7 +1111,6 @@ Config LoadConfig() {
 
 	cfg.reactions = ParseBool(get("discord-reactions"), true);
 	cfg.receive = ToLower(Trim(get("discord-receive"))) == "selected" ? ReceiveMode::Selected : ReceiveMode::All;
-
 	cfg.topicEnabled = ParseBool(get("discord-topic-status"), false);
 	if (const std::string v = get("discord-topic-online"); !v.empty())
 		cfg.topicOnline = v;
@@ -974,27 +1122,189 @@ Config LoadConfig() {
 	return cfg;
 }
 
-// The channel entries to bridge: bpa_discord_channels.json if it lists any, otherwise the single
-// channel from the old discord-channel-id / discord-webhook-url keys.
-std::vector<LinkSpec> LoadLinkSpecs(const Config& _cfg) {
+enum class ChannelFile { Missing, Ok, Broken };
+
+// The short-lived bpa_discord_channels.json: a bare JSON array of channel entries.
+ChannelFile ReadChannelArray(const char* _path, std::vector<LinkSpec>& _out) {
+	std::ifstream file(_path, std::ios::binary);
+	if (!file)
+		return ChannelFile::Missing;
+	std::stringstream buffer;
+	buffer << file.rdbuf();
+
+	try {
+		const nlohmann::json root = nlohmann::json::parse(buffer.str(), nullptr, true, /*ignore_comments=*/true);
+		if (!root.is_array())
+			return ChannelFile::Broken;
+		ParseChannelEntries(root, _out);
+		return ChannelFile::Ok;
+	} catch (const std::exception&) {
+		return ChannelFile::Broken;
+	}
+}
+
+// Removes the discord-* keys from a .properties file. A file that ends up with nothing but
+// comments and blank lines is deleted when _deleteWhenEmpty is set. Returns false if the file
+// couldn't be updated.
+bool StripLegacyKeys(const char* _path, bool _deleteWhenEmpty) {
+	std::vector<std::string> kept;
+	bool removedAny = false;
+	bool otherContent = false;
+	{
+		std::ifstream in(_path, std::ios::binary);
+		if (!in)
+			return true; // nothing there to clean up
+		std::string line;
+		while (std::getline(in, line)) {
+			const std::string trimmed = Trim(line);
+			if (!trimmed.empty() && trimmed[0] != '#' && trimmed[0] != '!') {
+				const size_t eq = trimmed.find('=');
+				const std::string key = Trim(eq == std::string::npos ? trimmed : trimmed.substr(0, eq));
+				if (IsLegacyKey(key)) {
+					removedAny = true;
+					continue;
+				}
+				otherContent = true;
+			}
+			kept.push_back(line);
+		}
+	}
+	if (!removedAny)
+		return true;
+
+	std::error_code ec;
+	if (_deleteWhenEmpty && !otherContent) {
+		std::filesystem::remove(_path, ec);
+		return !ec;
+	}
+
+	std::string text;
+	for (const std::string& line : kept)
+		text += line + "\n";
+	return WriteTextFile(_path, text);
+}
+
+enum class Migration { NothingToMigrate, Migrated, Failed };
+
+// Converts the old configuration into bpa_discord.json, checks that the new file reads back
+// correctly, and only then removes the old settings from the files they came from.
+Migration MigrateLegacySettings() {
+	const auto own = ReadProperties(CONFIG_FILE);
+	const auto server = ReadProperties(SERVER_CONFIG_FILE);
+	const bool fromOwn = HasLegacyKeys(own);
+	const bool fromServer = HasLegacyKeys(server);
+	const bool fromChannels = std::ifstream(CHANNELS_FILE).good();
+	if (!fromOwn && !fromServer && !fromChannels)
+		return Migration::NothingToMigrate;
+
 	std::vector<LinkSpec> specs;
-	LoadChannelSpecs(specs);
-
-	if (!specs.empty()) {
-		if (!_cfg.channelId.empty())
-			LogNow(Level::Warn, std::string("discord-channel-id is ignored because ") + CHANNELS_FILE +
-			                        " lists channels; add it there instead.");
-		return specs;
+	if (fromChannels && ReadChannelArray(CHANNELS_FILE, specs) == ChannelFile::Broken) {
+		LogNow(Level::Error, std::string("Couldn't read ") + CHANNELS_FILE +
+		                         " while converting the old settings; fix or delete it and restart. Nothing was changed.");
+		return Migration::Failed;
 	}
 
-	if (!_cfg.channelId.empty()) {
-		LinkSpec legacy;
-		legacy.label = "main";
-		legacy.channelId = _cfg.channelId;
-		legacy.webhookUrl = _cfg.webhookUrl;
-		specs.push_back(std::move(legacy));
+	std::string channelId, webhookUrl;
+	const Config cfg = ConfigFromProperties(own, server, channelId, webhookUrl);
+
+	if (!channelId.empty()) {
+		if (specs.empty()) {
+			LinkSpec legacy;
+			legacy.label = "main";
+			legacy.channelId = channelId;
+			legacy.webhookUrl = webhookUrl;
+			specs.push_back(std::move(legacy));
+		} else {
+			LogNow(Level::Warn, "discord-channel-id was ignored, as before, because channels were already "
+			                    "listed in " + std::string(CHANNELS_FILE) + ".");
+		}
 	}
-	return specs;
+	const bool placeholder = specs.empty();
+	if (placeholder)
+		specs.push_back(PlaceholderChannel());
+
+	const std::string text = BuildSettingsJson(cfg, specs, placeholder);
+	if (!WriteTextFile(SETTINGS_FILE, text)) {
+		LogNow(Level::Error, std::string("Couldn't write ") + SETTINGS_FILE + "; the old settings were left untouched.");
+		return Migration::Failed;
+	}
+
+	Settings check;
+	std::string error;
+	const bool readsBack = ParseSettings(text, check, &error) && check.specs.size() == specs.size() &&
+	                       check.config.token == cfg.token && check.config.guildId == cfg.guildId &&
+	                       check.config.prefix == cfg.prefix && check.config.postfix == cfg.postfix;
+	if (!readsBack) {
+		LogNow(Level::Error, std::string("The converted ") + SETTINGS_FILE +
+		                         " did not read back correctly; the old settings were left untouched.");
+		std::error_code ec;
+		std::filesystem::remove(SETTINGS_FILE, ec); // so the next start tries again
+		return Migration::Failed;
+	}
+
+	// Safe now: everything is in the new file. The old files are never written to again.
+	std::string cleanupProblems;
+	if (fromOwn && !StripLegacyKeys(CONFIG_FILE, true))
+		cleanupProblems += std::string(" ") + CONFIG_FILE;
+	if (fromServer && !StripLegacyKeys(SERVER_CONFIG_FILE, false))
+		cleanupProblems += std::string(" ") + SERVER_CONFIG_FILE;
+	if (fromChannels) {
+		std::error_code ec;
+		std::filesystem::remove(CHANNELS_FILE, ec);
+		if (ec)
+			cleanupProblems += std::string(" ") + CHANNELS_FILE;
+	}
+
+	std::string sources;
+	if (fromOwn)
+		sources += std::string(CONFIG_FILE);
+	if (fromServer)
+		sources += std::string(sources.empty() ? "" : ", ") + SERVER_CONFIG_FILE;
+	if (fromChannels)
+		sources += std::string(sources.empty() ? "" : ", ") + CHANNELS_FILE;
+	LogNow(Level::Info, "Converted the old settings from " + sources + " to " + SETTINGS_FILE +
+	                        " and removed them from the old file(s). Edit " + SETTINGS_FILE + " from now on.");
+	if (!cleanupProblems.empty())
+		LogNow(Level::Warn, "Couldn't remove the old settings from:" + cleanupProblems +
+		                        ". They are no longer used; delete the discord-* entries by hand.");
+	return Migration::Migrated;
+}
+
+// ---------------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------------
+
+// Reads bpa_discord.json, creating it first (from the old settings if there are any, otherwise
+// from a template) when it doesn't exist. Returns false when there are no usable settings.
+bool LoadSettings(Settings& _out) {
+	if (!std::ifstream(SETTINGS_FILE).good()) {
+		switch (MigrateLegacySettings()) {
+		case Migration::Failed:
+			return false;
+		case Migration::NothingToMigrate:
+			if (!WriteTextFile(SETTINGS_FILE, BuildSettingsJson(Config{}, { PlaceholderChannel() }, true))) {
+				LogNow(Level::Warn, std::string("Couldn't create ") + SETTINGS_FILE);
+				return false;
+			}
+			LogNow(Level::Warn, std::string("Generated ") + SETTINGS_FILE + "; fill it in and restart the server.");
+			break;
+		case Migration::Migrated:
+			break;
+		}
+	} else if (HasLegacyKeys(ReadProperties(CONFIG_FILE))) {
+		LogNow(Level::Warn, std::string(CONFIG_FILE) + " is no longer used; its settings belong in " + SETTINGS_FILE + ".");
+	}
+
+	std::ifstream file(SETTINGS_FILE, std::ios::binary);
+	std::stringstream buffer;
+	buffer << file.rdbuf();
+
+	std::string error;
+	if (!ParseSettings(buffer.str(), _out, &error)) {
+		LogNow(Level::Error, std::string("Couldn't parse ") + SETTINGS_FILE + ": " + error);
+		return false;
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------------
@@ -1511,7 +1821,7 @@ void BuildLinks(Bot& _bot, const std::vector<LinkSpec>& _specs) {
 
 		const std::string token = !spec.botToken.empty() ? spec.botToken : cfg.token;
 		if (token.empty()) {
-			LogNow(Level::Warn, entry + ": no bot_token, and discord-token is empty; skipped");
+			LogNow(Level::Warn, entry + ": no bot_token, and the global token is empty; skipped");
 			continue;
 		}
 
@@ -1613,18 +1923,21 @@ void VerifyWebhooks(Bot& _bot, Session& _session) {
 
 void StartBot() {
 	auto bot = std::make_unique<Bot>();
-	bot->config = LoadConfig();
+	Settings settings;
+	const bool haveSettings = LoadSettings(settings);
+	bot->config = settings.config;
 	if (g_api && g_api->server.getVersion) {
 		if (const char* version = g_api->server.getVersion())
 			bot->serverVersion = version;
 	}
 
-	BuildLinks(*bot, LoadLinkSpecs(bot->config));
+	if (haveSettings)
+		BuildLinks(*bot, settings.specs);
 
 	if (bot->links.empty()) {
-		LogNow(Level::Warn, std::string("No usable Discord channel is configured. Add one to ") + CHANNELS_FILE +
-		                        " (and set discord-token in " + CONFIG_FILE +
-		                        ", or a bot_token per channel); the Discord bot will not start.");
+		LogNow(Level::Warn, std::string("No usable Discord channel is configured. Add one to \"channels\" in ") +
+		                        SETTINGS_FILE + " (and set \"token\", or a \"bot_token\" per channel); the Discord "
+		                        "bot will not start.");
 		g_bot = std::move(bot); // keep it around so the (empty) registry still works
 		return;
 	}
@@ -2126,7 +2439,7 @@ void OnServerTick(const bp_api* api, const bp_server_tick_event*) {
 
 	PumpTopicUpdates(bot);
 
-	// Work out who should hear each queued Discord message. With discord-receive=selected only
+	// Work out who should hear each queued Discord message. With "receive": "selected" only
 	// players who currently talk through that channel do.
 	struct Delivery {
 		InboundMessage message;
