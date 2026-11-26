@@ -48,64 +48,64 @@ allowed: global settings at the top, then the `channels` list.
 
 ```json
 {
-	"token": "default bot token",
-	"guild_id": "",
-	"prefix": "[",
-	"postfix": "]",
-	"reactions": true,
-	"receive": "all",
-	"topic_status": false,
-	"topic_online": "Online | Players: {count}",
-	"topic_offline": "Offline",
-	"crash_reports": true,
-	"execute_role_ids": [],
-	"execute_user_ids": [],
-	"channels": [
-		{
-			"label": "main",
-			"channel_id": "123456789012345678",
-			"webhook_url": "https://discord.com/api/webhooks/...",
-			"bot_token": "bot token for this channel"
-		},
-		{
-			"label": "Friends",
-			"channel_id": "234567890123456789",
-			"guild_id": "345678901234567890",
-			"bot_token": "a different bot, for a different Discord server",
-			"prefix": "&aF-",
-			"postfix": ":",
-			"reactions": false
-		}
-	]
+  "token": "default bot token",
+  "guild_id": "",
+  "prefix": "[",
+  "postfix": "]",
+  "reactions": true,
+  "receive": "all",
+  "topic_status": false,
+  "topic_online": "Online | Players: {count}",
+  "topic_offline": "Offline",
+  "crash_reports": true,
+  "execute_role_ids": [],
+  "execute_user_ids": [],
+  "channels": [
+    {
+      "label": "main",
+      "channel_id": "123456789012345678",
+      "webhook_url": "https://discord.com/api/webhooks/...",
+      "bot_token": "bot token for this channel"
+    },
+    {
+      "label": "Friends",
+      "channel_id": "234567890123456789",
+      "guild_id": "345678901234567890",
+      "bot_token": "a different bot, for a different Discord server",
+      "prefix": "&aF-",
+      "postfix": ":",
+      "reactions": false
+    }
+  ]
 }
 ```
 
 ### Global settings
 
-| key | default | meaning |
-|-----|---------|---------|
-| `token` | | default bot token (enable the Message Content Intent). Channels can bring their own `bot_token`. |
-| `guild_id` | | makes slash commands appear instantly in that server instead of globally (which can take up to an hour). Channels can set their own. |
-| `prefix`, `postfix` | `[` and `]` | text around a Discord user's name in-game, max 4 visible characters each, see below. Channels can override both. |
-| `reactions` | `true` | show `[name] reacted with :emoji:` in-game, see below. Channels can override it. |
-| `receive` | `"all"` | which channels players hear: `"all"`, or `"selected"` (only the channel they picked with `/discord select`) |
-| `topic_status` | `false` | show live status in the channel topics. **Overwrites** the topic and needs the Manage Channels permission. Updates are rate-limited (at most one every 5 minutes). Channels can override it. |
-| `topic_online` | `Online \| Players: {count}` | topic while running; `{count}` = players online |
-| `topic_offline` | `Offline` | topic set on shutdown |
-| `crash_reports` | `true` | post the crash log to the channels when the server crashes |
-| `execute_role_ids`, `execute_user_ids` | none | Discord ids (an array of strings or numbers, or one comma-separated string) allowed to use `/execute`. The command is only enabled when one is set. |
+| key                                    | default                      | meaning                                                                                                                                                                                      |
+| -------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `token`                                |                              | default bot token (enable the Message Content Intent). Channels can bring their own `bot_token`.                                                                                             |
+| `guild_id`                             |                              | makes slash commands appear instantly in that server instead of globally (which can take up to an hour). Channels can set their own.                                                         |
+| `prefix`, `postfix`                    | `[` and `]`                  | text around a Discord user's name in-game, max 4 visible characters each, see below. Channels can override both.                                                                             |
+| `reactions`                            | `true`                       | show `[name] reacted with :emoji:` in-game, see below. Channels can override it.                                                                                                             |
+| `receive`                              | `"all"`                      | which channels players hear: `"all"`, or `"selected"` (only the channel they picked with `/discord select`)                                                                                  |
+| `topic_status`                         | `false`                      | show live status in the channel topics. **Overwrites** the topic and needs the Manage Channels permission. Updates are rate-limited (at most one every 5 minutes). Channels can override it. |
+| `topic_online`                         | `Online \| Players: {count}` | topic while running; `{count}` = players online                                                                                                                                              |
+| `topic_offline`                        | `Offline`                    | topic set on shutdown                                                                                                                                                                        |
+| `crash_reports`                        | `true`                       | post the crash log to the channels when the server crashes                                                                                                                                   |
+| `execute_role_ids`, `execute_user_ids` | none                         | Discord ids (an array of strings or numbers, or one comma-separated string) allowed to use `/execute`. The command is only enabled when one is set.                                          |
 
 ### Channels
 
 One entry per bridged Discord channel.
 
-| key            | required | meaning |
-|----------------|----------|---------|
-| `label`        | yes      | name shown in-game and typed in `/discord select <label>`. Unique (case-insensitive), max 32 characters, and not `id`. |
-| `channel_id`   | yes      | the Discord channel to bridge |
-| `webhook_url`  | no       | webhook of the **same** channel. Chat is relayed under each player's name and skin face. Without it, chat is relayed as the bot. |
-| `bot_token`    | no       | bot for this channel. Falls back to the global `token`. Channels with the same token share one bot connection. |
-| `guild_id`, `prefix`, `postfix`, `reactions`, `topic_status` | no | per-channel overrides of the global settings; leave a key out to use the global value |
+| key                                                          | required | meaning                                                                                                                          |
+| ------------------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `label`                                                      | yes      | name shown in-game and typed in `/discord select <label>`. Unique (case-insensitive), max 32 characters, and not `id`.           |
+| `channel_id`                                                 | yes      | the Discord channel to bridge                                                                                                    |
+| `webhook_url`                                                | no       | webhook of the **same** channel. Chat is relayed under each player's name and skin face. Without it, chat is relayed as the bot. |
+| `bot_token`                                                  | no       | bot for this channel. Falls back to the global `token`. Channels with the same token share one bot connection.                   |
+| `guild_id`, `prefix`, `postfix`, `reactions`, `topic_status` | no       | per-channel overrides of the global settings; leave a key out to use the global value                                            |
 
 The **first** entry is the default channel: players talk through it when they join.
 A bad entry (duplicate label, invalid id, no token, ...) is skipped with a warning in the server log;
@@ -124,12 +124,12 @@ wrong, the old files are left untouched and the server log says why.
 
 ## Choosing a channel in-game
 
-| command | who | what |
-|---------|-----|------|
-| `/discord` | everyone | shows the channel your chat goes to |
-| `/discord list` | everyone | lists the channels; `>` marks yours |
-| `/discord select <label>` | everyone | send your chat to that channel (label may contain spaces) |
-| `/discord select id <channel id>` | operators | the same, by Discord channel id |
+| command                           | who       | what                                                      |
+| --------------------------------- | --------- | --------------------------------------------------------- |
+| `/discord`                        | everyone  | shows the channel your chat goes to                       |
+| `/discord list`                   | everyone  | lists the channels; `>` marks yours                       |
+| `/discord select <label>`         | everyone  | send your chat to that channel (label may contain spaces) |
+| `/discord select id <channel id>` | operators | the same, by Discord channel id                           |
 
 Your selection lasts until you leave; on the next join you are back on the default channel.
 Join/leave messages, server start/stop notices and crash reports go to every channel.
