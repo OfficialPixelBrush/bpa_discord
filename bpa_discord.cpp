@@ -67,7 +67,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_discord";
 constexpr const char* ADDON_NAME = "Discord Bridge";
-constexpr const char* ADDON_VERSION = "0.3.0";
+constexpr const char* ADDON_VERSION = "0.3.1";
 constexpr const char* CONFIG_FILE = "bpa_discord.properties";
 constexpr const char* CHANNELS_FILE = "bpa_discord_channels.json"; // short-lived interim format, only migrated
 constexpr const char* SETTINGS_FILE = "bpa_discord.json";
@@ -602,12 +602,10 @@ std::string SanitizeWebhookUsername(const std::string& _username) {
 	return name;
 }
 
-std::string DisplayNameForMention(const dpp::user& _user, const dpp::guild_member& _member) {
-	const std::string nick = _member.get_nickname();
-	if (!nick.empty())
-		return nick;
-	if (!_user.global_name.empty())
-		return _user.global_name;
+// Discord users are always shown by their account username (the unique, lowercase handle), never
+// by their server nickname or global display name. Display names are free-form Unicode that Beta's
+// font can't draw, and they would make the same person look different from one message to the next.
+std::string AccountName(const dpp::user& _user) {
 	return _user.username;
 }
 
@@ -617,8 +615,9 @@ std::string ResolveDiscordMentions(const dpp::message& _msg) {
 	std::string content = _msg.content;
 
 	for (const auto& [user, member] : _msg.mentions) {
+		(void)member;
 		const std::string idStr = std::to_string(static_cast<uint64_t>(user.id));
-		const std::string label = "@" + DisplayNameForMention(user, member);
+		const std::string label = "@" + AccountName(user);
 		ReplaceAll(content, "<@!" + idStr + ">", label);
 		ReplaceAll(content, "<@" + idStr + ">", label);
 	}
@@ -1325,6 +1324,26 @@ void SendConfirmCallbackLog(Bot* _bot, const Link* _link, const char* _what,
 		         std::string("Failed to send ") + _what + " to '" + _link->label + "': " + _result.get_error().message);
 }
 
+// A send that takes longer than this is reported: a slow or stalled Discord connection is what
+// makes messages arrive late, or several at once.
+constexpr long long SLOW_SEND_WARN_MS = 2000;
+
+// Completion callback for fire-and-forget sends: logs failures, and sends that took suspiciously
+// long. Runs on a D++ thread, so it only logs through the queue.
+std::function<void(const dpp::confirmation_callback_t&)> SendCallback(Bot* _bot, const Link* _link, const char* _what) {
+	const auto sentAt = std::chrono::steady_clock::now();
+	return [_bot, _link, _what, sentAt](const dpp::confirmation_callback_t& _result) {
+		SendConfirmCallbackLog(_bot, _link, _what, _result);
+		const auto ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sentAt).count();
+		if (ms >= SLOW_SEND_WARN_MS)
+			LogAsync(*_bot, Level::Warn,
+			         std::format("Sending {} to '{}' took {} ms; Discord or the network is slow, so Discord "
+			                     "messages will show up late.",
+			                     _what, _link->label, ms));
+	};
+}
+
 // Sends one player's chat message to the channel they are currently talking through.
 void SendPlayerChat(Bot& _bot, Link& _link, const std::string& _username, const std::string& _message) {
 	if (!CanSend(_bot, _link))
@@ -1345,16 +1364,14 @@ void SendPlayerChat(Bot& _bot, Link& _link, const std::string& _username, const 
 
 		dpp::message msg(content);
 		msg.set_allowed_mentions(false, false, false, false, {}, {});
-		cluster.execute_webhook(wh, msg, false, 0, "", [bot, link](const dpp::confirmation_callback_t& result) {
-			SendConfirmCallbackLog(bot, link, "chat via webhook", result);
-		});
+		cluster.execute_webhook(wh, msg, false, 0, "", SendCallback(bot, link, "chat via webhook"));
 		return;
 	}
 
 	// No webhook configured for this channel: plain message under the bot's identity.
 	cluster.message_create(
 	    MakeMessage(_link, std::format("[{}] {}", RemoveMinecraftFormatting(_username), content)),
-	    [bot, link](const dpp::confirmation_callback_t& result) { SendConfirmCallbackLog(bot, link, "chat message", result); });
+	    SendCallback(bot, link, "chat message"));
 }
 
 // Join/leave embeds go to every bridged channel.
@@ -1378,9 +1395,7 @@ void SendPlayerEvent(Bot& _bot, const std::string& _rawUsername, bool _joined, s
 
 		dpp::message msg(link->channel, embed);
 		msg.set_allowed_mentions(false, false, false, false, {}, {});
-		link->session->cluster->message_create(msg, [bot, link](const dpp::confirmation_callback_t& result) {
-			SendConfirmCallbackLog(bot, link, "join/leave embed", result);
-		});
+		link->session->cluster->message_create(msg, SendCallback(bot, link, "join/leave embed"));
 	}
 }
 
@@ -1399,8 +1414,7 @@ void SendNotice(Bot& _bot, const std::string& _text, uint32_t _color) {
 			continue;
 
 		dpp::message msg(link->channel, embed);
-		link->session->cluster->message_create(
-		    msg, [bot, link](const dpp::confirmation_callback_t& result) { SendConfirmCallbackLog(bot, link, "notice", result); });
+		link->session->cluster->message_create(msg, SendCallback(bot, link, "notice"));
 	}
 }
 
@@ -2015,8 +2029,7 @@ void StartBot() {
 				InboundMessage chat;
 				chat.kind = InboundMessage::Kind::Chat;
 				chat.link = link;
-				const std::string nick = event.msg.member.get_nickname();
-				chat.author = !nick.empty() ? nick : event.msg.author.username;
+				chat.author = AccountName(event.msg.author);
 				chat.content = ResolveDiscordMentions(event.msg);
 
 				std::lock_guard lock(raw->mutex);
@@ -2035,7 +2048,7 @@ void StartBot() {
 				InboundMessage reaction;
 				reaction.kind = InboundMessage::Kind::Reaction;
 				reaction.link = link;
-				reaction.author = DisplayNameForMention(event.reacting_user, event.reacting_member);
+				reaction.author = AccountName(event.reacting_user);
 				reaction.content = EmojiLabel(event.reacting_emoji);
 
 				std::lock_guard lock(raw->mutex);
@@ -2123,15 +2136,23 @@ void StopBot() {
 		workers.emplace_back([cluster = std::move(job.cluster), links = std::move(job.links), remaining,
 		                      botPtr]() mutable {
 			try {
-				// Fire-and-forget goodbye; never wait on Discord here.
+				// Bounded wait so the goodbye and the topic edits can go out before the gateway is
+				// torn down. If Discord is slow or rate-limiting us they won't make it.
+				std::vector<std::shared_ptr<std::atomic<bool>>> topicFlags;
+
+				dpp::embed goodbye;
+				goodbye.set_color(0xFF5555).set_description("Server stopped!");
 				for (Link* link : links) {
-					cluster->message_create(dpp::message(link->channel, "Server stopped!"),
-					                        [](const dpp::confirmation_callback_t&) {});
+					auto flag = std::make_shared<std::atomic<bool>>(false);
+					topicFlags.push_back(flag);
+					dpp::message msg(link->channel, goodbye);
+					msg.set_allowed_mentions(false, false, false, false, {}, {});
+					cluster->message_create(msg, [botPtr, link, flag](const dpp::confirmation_callback_t& result) {
+						SendConfirmCallbackLog(botPtr, link, "stop notice", result);
+						flag->store(true);
+					});
 				}
 
-				// Bounded wait so the topic edits can go out before the gateway is torn down. If
-				// Discord is rate-limiting us they won't make it, and the previous topics stay.
-				std::vector<std::shared_ptr<std::atomic<bool>>> topicFlags;
 				for (Link* link : links) {
 					if (!link->topicEnabled)
 						continue;
@@ -2146,17 +2167,12 @@ void StopBot() {
 					                });
 				}
 
-				if (topicFlags.empty()) {
-					std::this_thread::sleep_for(std::chrono::milliseconds(150));
-				} else {
-					const auto topicDeadline = std::chrono::steady_clock::now() + TOPIC_SHUTDOWN_WAIT;
-					const auto allDone = [&] {
-						return std::all_of(topicFlags.begin(), topicFlags.end(),
-						                   [](const auto& f) { return f->load(); });
-					};
-					while (!allDone() && std::chrono::steady_clock::now() < topicDeadline)
-						std::this_thread::sleep_for(std::chrono::milliseconds(25));
-				}
+				const auto topicDeadline = std::chrono::steady_clock::now() + TOPIC_SHUTDOWN_WAIT;
+				const auto allDone = [&] {
+					return std::all_of(topicFlags.begin(), topicFlags.end(), [](const auto& f) { return f->load(); });
+				};
+				while (!allDone() && std::chrono::steady_clock::now() < topicDeadline)
+					std::this_thread::sleep_for(std::chrono::milliseconds(25));
 				cluster->shutdown();
 				cluster.reset();
 			} catch (...) {
@@ -2204,13 +2220,34 @@ bp_player* CommandPlayer(const bp_api* _api, const bp_cmd_action_ctx* _ctx) {
 	return entity ? _api->entity.toPlayer(entity) : nullptr;
 }
 
-Link* LinkOfPlayer(Bot& _bot, bp_player* _player) {
-	std::lock_guard lock(_bot.mutex);
-	for (const auto& p : _bot.players) {
+std::string PlayerNameOf(const bp_api* _api, bp_player* _player) {
+	const char* raw = (_api && _player) ? _api->player.getUsername(_player) : nullptr;
+	return raw ? raw : std::string{};
+}
+
+// Finds a player's registry entry. The host does not necessarily hand out the same bp_player*
+// for one player everywhere (join/chat events vs. a command's executor), so match by pointer
+// first and then by name. The caller holds the bot mutex.
+PlayerEntry* FindPlayerEntryLocked(Bot& _bot, bp_player* _player, const std::string& _name) {
+	for (auto& p : _bot.players) {
 		if (p.player == _player)
-			return p.link;
+			return &p;
+	}
+	if (!_name.empty()) {
+		for (auto& p : _bot.players) {
+			if (EqualsIgnoreCase(p.name, _name))
+				return &p;
+		}
 	}
 	return nullptr;
+}
+
+// Server thread only (it calls into the host API).
+Link* LinkOfPlayer(Bot& _bot, bp_player* _player) {
+	const std::string name = PlayerNameOf(g_api, _player);
+	std::lock_guard lock(_bot.mutex);
+	PlayerEntry* entry = FindPlayerEntryLocked(_bot, _player, name);
+	return entry ? entry->link : nullptr;
 }
 
 void CmdDiscordInfo(const bp_api* _api, const bp_cmd_action_ctx* _ctx, void*) {
@@ -2246,15 +2283,17 @@ void SelectLink(const bp_api* _api, const bp_cmd_action_ctx* _ctx, Link* _link) 
 		return;
 	}
 
+	const std::string name = PlayerNameOf(_api, player);
 	bool found = false;
 	{
 		std::lock_guard lock(g_bot->mutex);
-		for (auto& p : g_bot->players) {
-			if (p.player == player) {
-				p.link = _link;
-				found = true;
-				break;
-			}
+		if (PlayerEntry* entry = FindPlayerEntryLocked(*g_bot, player, name)) {
+			entry->link = _link;
+			found = true;
+		} else if (!name.empty()) {
+			// Not registered (e.g. the join was missed): register them now rather than fail.
+			g_bot->players.push_back(PlayerEntry{ player, name, g_bot->tick - CHAT_READY_TICKS, _link });
+			found = true;
 		}
 	}
 	if (!found) {
@@ -2368,7 +2407,11 @@ void OnPlayerJoin(const bp_api* api, const bp_player_join_event* ev) {
 	size_t online;
 	{
 		std::lock_guard lock(g_bot->mutex);
-		g_bot->players.push_back(PlayerEntry{ ev->player, name, g_bot->tick, defaultLink });
+		// Never register one player twice, or they'd receive every Discord message twice.
+		if (PlayerEntry* existing = FindPlayerEntryLocked(*g_bot, ev->player, name))
+			*existing = PlayerEntry{ ev->player, name, g_bot->tick, defaultLink };
+		else
+			g_bot->players.push_back(PlayerEntry{ ev->player, name, g_bot->tick, defaultLink });
 		online = g_bot->players.size();
 	}
 	MarkTopicsDirty(*g_bot);
@@ -2380,14 +2423,13 @@ void OnPlayerLeave(const bp_api* api, const bp_player_leave_event* ev) {
 		return;
 
 	std::string name;
+	const std::string leavingName = PlayerNameOf(api, ev->player);
 	size_t online;
 	{
 		std::lock_guard lock(g_bot->mutex);
-		auto it = std::find_if(g_bot->players.begin(), g_bot->players.end(),
-		                       [&](const PlayerEntry& p) { return p.player == ev->player; });
-		if (it != g_bot->players.end()) {
-			name = it->name;
-			g_bot->players.erase(it);
+		if (PlayerEntry* entry = FindPlayerEntryLocked(*g_bot, ev->player, leavingName)) {
+			name = entry->name;
+			g_bot->players.erase(g_bot->players.begin() + (entry - g_bot->players.data()));
 		}
 		online = g_bot->players.size();
 	}
@@ -2408,6 +2450,8 @@ void OnPlayerChat(const bp_api* api, bp_player_chat_event* ev) {
 
 	// Chat goes to the channel this player picked with /discord select.
 	Link* link = LinkOfPlayer(*g_bot, ev->player);
+	if (!link && !g_bot->links.empty())
+		link = g_bot->links.front().get(); // not registered: use the default channel instead of dropping it
 	if (!link)
 		return;
 
@@ -2457,6 +2501,8 @@ void OnServerTick(const bp_api* api, const bp_server_tick_event*) {
 				if (bot.tick - p.joinTick < CHAT_READY_TICKS)
 					continue;
 				if (bot.config.receive == ReceiveMode::Selected && p.link != delivery.message.link)
+					continue;
+				if (std::find(delivery.recipients.begin(), delivery.recipients.end(), p.player) != delivery.recipients.end())
 					continue;
 				delivery.recipients.push_back(p.player);
 			}
